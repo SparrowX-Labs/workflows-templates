@@ -122,7 +122,9 @@ jobs:
               --image-ids "imageDigest=$source_digest" \
               --region "$AWS_REGION" \
               --output json |
-              jq -er '.images[0].imageManifest' > "$manifest_file"
+              # Extract the manifest string without reserializing or adding a
+              # newline; the manifest bytes determine the ECR image digest.
+              jq -erj '.images[0].imageManifest' > "$manifest_file"
 
             # Retrieve the manifest media type.
             media_type=$(aws ecr batch-get-image \

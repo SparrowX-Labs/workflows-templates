@@ -85,34 +85,37 @@ jobs:
           # Image layers are not uploaded again.
           copy_tag() {
             local source_tag="$1"
-            local destination_tag="$2"
+            local target_tag="$2"
             local manifest_file
+            local media_type
 
-            manifest_file="$(mktemp)"
+            manifest_file=$(mktemp)
+            trap 'rm -f "$manifest_file"' RETURN
 
-            if ! aws ecr batch-get-image \
+            # Retrieve the manifest without adding an extra newline.
+            aws ecr batch-get-image \
               --repository-name "$REPOSITORY" \
               --image-ids "imageTag=$source_tag" \
               --region "$AWS_REGION" \
-              --query 'images[0].imageManifest' \
-              --output text > "$manifest_file"; then
-              rm -f "$manifest_file"
-              echo "::error::Failed to retrieve manifest for tag $source_tag"
-              return 1
-            fi
+              --output json |
+              jq -j '.images[0].imageManifest' > "$manifest_file"
 
-            if ! aws ecr put-image \
+            # Retrieve the manifest media type.
+            media_type=$(aws ecr batch-get-image \
               --repository-name "$REPOSITORY" \
-              --image-tag "$destination_tag" \
-              --image-manifest "file://$manifest_file" \
-              --region "$AWS_REGION"; then
-              rm -f "$manifest_file"
-              echo "::error::Failed to create tag $destination_tag"
-              return 1
-            fi
+              --image-ids "imageTag=$source_tag" \
+              --region "$AWS_REGION" \
+              --query 'images[0].imageManifestMediaType' \
+              --output text)
 
-            rm -f "$manifest_file"
-            echo "Copied $source_tag -> $destination_tag"
+            aws ecr put-image \
+              --repository-name "$REPOSITORY" \
+              --image-tag "$target_tag" \
+              --image-manifest "file://$manifest_file" \
+              --image-manifest-media-type "$media_type" \
+              --region "$AWS_REGION"
+
+            echo "Copied $source_tag -> $target_tag"
           }
 
           # Delete only the specified tag.

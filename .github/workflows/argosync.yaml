@@ -97,7 +97,7 @@ jobs:
             --server ${{ secrets.ARGOCD_SERVER }}
             --auth-token ${{ secrets.ARGOCD_AUTH_TOKEN }}
             --grpc-web
-            --values ${{ env.ENV_PARAMS_FILE }}
+            --source-position 1
             --helm-set-string image.repository=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_FULL_NAME }}
             --helm-set-string image.tag=${{ env.IMAGE_TAG }}
 

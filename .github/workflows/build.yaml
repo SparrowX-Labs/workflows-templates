@@ -1,0 +1,154 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      env-params-file:
+        description: Path to the ECS parameters file
+        required: true
+        type: string
+      frontend:
+        description: Whether this is a frontend build
+        required: false
+        type: boolean
+        default: false
+      authoritative-build:
+        description: Whether to publish the image to ECR after building
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      image-tag:
+        description: Image tag for the built image
+        value: ${{ jobs.build.outputs.image-tag }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    outputs:
+      image-tag: ${{ steps.image-tag.outputs.image-tag }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Load image configuration
+        if: inputs.authoritative-build
+        run: |
+          IMAGE_NAMESPACE="$(yq -r '.image.nameSpace' "$ENV_PARAMS_FILE")"
+          IMAGE_REPOSITORY="$(yq -r '.image.repository' "$ENV_PARAMS_FILE")"
+          echo "ECR_REPOSITORY_FULL_NAME=$IMAGE_NAMESPACE/$IMAGE_REPOSITORY" >> "$GITHUB_ENV"
+
+      - name: Load frontend configuration
+        if: inputs.frontend
+        run: |
+          API_BASE_URL="$(yq -r '.frontend.apiBaseUrl' "$ENV_PARAMS_FILE")"
+          echo "API_BASE_URL=$API_BASE_URL" >> "$GITHUB_ENV"
+
+      - name: Set image tag
+        id: image-tag
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "image-tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        if: inputs.authoritative-build
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: >-
+            arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: inputs.authoritative-build
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check whether image exists in ECR
+        if: inputs.authoritative-build
+        id: image
+        run: |
+          set +e
+          describe_output=$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY_FULL_NAME" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --region "$AWS_REGION" 2>&1)
+          describe_status=$?
+          set -e
+
+          if [ "$describe_status" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image already exists; skipping build and push."
+          elif grep -q "ImageNotFoundException" <<< "$describe_output"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Image does not exist; it will be built and pushed."
+          else
+            echo "$describe_output"
+            exit "$describe_status"
+          fi
+
+      - name: Build Docker image
+        if: >-
+          steps.image.outputs.exists != 'true' || !inputs.authoritative-build
+        env:
+          AUTHORITATIVE_BUILD: ${{ inputs.authoritative-build }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          if [ "$AUTHORITATIVE_BUILD" = "true" ]; then
+            IMAGE_REF="$ECR_REGISTRY/$ECR_REPOSITORY_FULL_NAME:$IMAGE_TAG"
+          else
+            IMAGE_REF="$IMAGE_TAG"
+          fi
+
+          if [ "${{ inputs.frontend }}" = "true" ]; then
+            docker build \
+              --build-arg VITE_API_BASE_URL="$API_BASE_URL" \
+              -t "$IMAGE_REF" \
+              .
+          else
+            docker build \
+              -t "$IMAGE_REF" \
+              .
+          fi
+
+      - name: Push Docker image
+        if: inputs.authoritative-build && steps.image.outputs.exists != 'true'
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: docker push "$ECR_REGISTRY/$ECR_REPOSITORY_FULL_NAME:$IMAGE_TAG"
+
+      - name: Add build summary
+        if: inputs.authoritative-build
+        run: |
+          ECR_REPOSITORY="${ECR_REPOSITORY_FULL_NAME:-Unavailable}"
+          IMAGE_TAG="${{ steps.image-tag.outputs.image-tag || 'Unavailable' }}"
+          IMAGE_EXISTS="${{ steps.image.outputs.exists || 'Unknown' }}"
+          BUILD_MODE="non-authoritative"
+          if [ "${{ inputs.authoritative-build }}" = "true" ]; then
+            BUILD_MODE="authoritative"
+          fi
+
+          {
+            echo "## Build"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| ECR repository | \`$ECR_REPOSITORY\` |"
+            echo "| Image tag | \`$IMAGE_TAG\` |"
+            echo "| Build mode | \`$BUILD_MODE\` |"
+            echo "| Image existed before build | \`$IMAGE_EXISTS\` |"
+            echo "| Published to ECR | \`${{ inputs.authoritative-build }}\` |"
+            echo "| Result | \`${{ job.status }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

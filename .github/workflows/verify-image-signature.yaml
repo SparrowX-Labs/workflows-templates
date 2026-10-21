@@ -1,0 +1,101 @@
+name: Verify Image Signature
+
+on:
+  workflow_call:
+    inputs:
+      image-uri:
+        description: Full immutable ECR image URI in registry/repository@sha256:digest format    
+        required: true
+        type: string
+      certificate-identity-regexp:
+        description: Expected Sigstore certificate identity regular expression
+        required: false
+        default: '^https://github\.com/SparrowX-ECS/workflows-templates/\.github/workflows/sign-image\.yaml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+        type: string
+      certificate-oidc-issuer:
+        description: Expected OIDC issuer in the signing certificate
+        required: false
+        default: https://token.actions.githubusercontent.com
+        type: string
+    outputs:
+      status:
+        description: Image signature verification status
+        value: ${{ jobs.verify-image-signature.outputs.status }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  IMAGE_URI: ${{ inputs.image-uri }}
+
+jobs:
+  verify-image-signature:
+    name: Verify Image Signature
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Verify image signature
+        id: verify
+        continue-on-error: true
+        env:
+          CERTIFICATE_IDENTITY_REGEXP: ${{ inputs.certificate-identity-regexp }}
+          CERTIFICATE_OIDC_ISSUER: ${{ inputs.certificate-oidc-issuer }}
+        run: |
+          case "$IMAGE_URI" in
+            *@sha256:*) ;;
+            *)
+              echo "image-uri must use registry/repository@sha256:digest format."
+              exit 1
+              ;;
+          esac
+
+          cosign verify "$IMAGE_URI" \
+            --certificate-identity-regexp "$CERTIFICATE_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER"
+
+      - name: Add verification summary
+        id: summary
+        if: always()
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          IMAGE_URI: ${{ env.IMAGE_URI }}
+        run: |
+          STATUS=failed
+          if [ "$VERIFY_OUTCOME" = success ]; then
+            STATUS=passed
+          fi
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Image Signature Verification"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Tool | Cosign |"
+            echo "| Image | $IMAGE_URI |"
+            echo "| Certificate identity | ${{ inputs.certificate-identity-regexp }} |"
+            echo "| OIDC issuer | ${{ inputs.certificate-oidc-issuer }} |"
+            echo "| Result | **$STATUS** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" = failed ]; then
+            exit 1
+          fi

@@ -1,0 +1,136 @@
+name: Smoke Test
+
+on:
+  workflow_call:
+    inputs:
+      env-params-file:
+        description: Path to the ECS parameters file
+        required: true
+        type: string
+      base-url:
+        description: Base URL of the deployed service
+        required: true
+        type: string
+      timeout:
+        description: Maximum time in seconds to wait for the service
+        required: false
+        default: '120'
+        type: string
+
+    outputs:
+      status:
+        description: Smoke test status
+        value: ${{ jobs.smoke-test.outputs.status }}
+      passed:
+        description: Number of smoke tests that passed
+        value: ${{ jobs.smoke-test.outputs.passed }}
+      total:
+        description: Total number of smoke tests
+        value: ${{ jobs.smoke-test.outputs.total }}
+
+permissions:
+  contents: read
+
+env:
+  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
+  BASE_URL: ${{ inputs.base-url }}
+  TIMEOUT: ${{ inputs.timeout }}
+
+jobs:
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      passed: ${{ steps.result.outputs.passed }}
+      total: ${{ steps.result.outputs.total }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Load health check configuration
+        run: |
+          echo "SMOKE_TEST_PATH=$(yq -r '.loadBalancer.smokeTestPath' "$ENV_PARAMS_FILE")" >> "$GITHUB_ENV"
+
+      - name: Run smoke test
+        run: |
+          URL="${BASE_URL%/}${SMOKE_TEST_PATH}"
+
+          echo "Testing: $URL"
+          echo "Waiting up to ${TIMEOUT}s for the service to become healthy..."
+
+          START_TIME=$(date +%s)
+          TEST_EXIT_CODE=1
+
+          while true; do
+            HTTP_STATUS=$(curl \
+              --silent \
+              --show-error \
+              --output /tmp/response.txt \
+              --write-out "%{http_code}" \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "$URL" || true)
+
+            echo "HTTP status: $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              echo "Smoke test passed."
+              cat /tmp/response.txt
+              TEST_EXIT_CODE=0
+              break
+            fi
+
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+
+            if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+              echo "Smoke test failed after ${TIMEOUT}s."
+              echo "Last HTTP status: $HTTP_STATUS"
+              echo "Last response:"
+              cat /tmp/response.txt || true
+              break
+            fi
+
+            echo "Service not ready. Retrying in 5 seconds..."
+            sleep 5
+          done
+
+          printf '%s\n' "$TEST_EXIT_CODE" > smoke-test-exit-code.txt
+          exit 0
+
+      - name: Record smoke test result
+        id: result
+        if: always()
+        run: |
+          if [ "$(cat smoke-test-exit-code.txt 2>/dev/null || echo 1)" -eq 0 ]; then
+            status=passed
+            passed=1
+          else
+            status=failed
+            passed=0
+          fi
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          echo "total=1" >> "$GITHUB_OUTPUT"
+
+      - name: Add smoke test summary
+        if: always()
+        run: |
+          {
+            echo "## Smoke Test"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`${BASE_URL}${SMOKE_TEST_PATH}\` |"
+            echo "| Timeout | \`${TIMEOUT}s\` |"
+            echo "| Method | \`GET\` |"
+            echo "| Status | \`${{ steps.result.outputs.status }}\` |"
+            echo "| Tests passed | \`${{ steps.result.outputs.passed }}/${{ steps.result.outputs.total }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

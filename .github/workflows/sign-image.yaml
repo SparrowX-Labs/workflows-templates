@@ -1,0 +1,118 @@
+name: Sign Image
+
+on:
+  workflow_call:
+    inputs:
+      env-params-file:
+        description: Path to the ECS parameters file
+        required: true
+        type: string
+      image-tag:
+        description: Immutable image tag to sign
+        required: true
+        type: string
+    outputs:
+      status:
+        description: Image signing status
+        value: ${{ jobs.sign-image.outputs.status }}
+      image-uri:
+        description: Full Immutable Image URI
+        value: ${{ jobs.sign-image.outputs.image-uri }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
+  IMAGE_TAG: ${{ inputs.image-tag }}
+
+jobs:
+  sign-image:
+    name: Sign Container Image
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+      image-uri: ${{ steps.image.outputs.uri }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Load image configuration
+        run: |
+          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.image.nameSpace' "$ENV_PARAMS_FILE")/$(yq -r '.image.repository' "$ENV_PARAMS_FILE")" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image digest
+        id: image
+        env:
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY_FULL_NAME }}
+        run: |
+          IMAGE_DIGEST="$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ]; then
+            echo "Image tag '$IMAGE_TAG' was not found in ECR."
+            exit 1
+          fi
+
+          IMAGE_URI="${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY@$IMAGE_DIGEST"
+          echo "digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign image with Cosign
+        id: sign
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+        run: cosign sign --yes "$IMAGE_URI"
+
+      - name: Add signing summary
+        id: summary
+        if: always()
+        env:
+          SIGN_OUTCOME: ${{ steps.sign.outcome }}
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+        run: |
+          STATUS=failed
+          if [ "$SIGN_OUTCOME" = success ]; then
+            STATUS=passed
+          fi
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Image Signing"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Tool | Cosign keyless signing |"
+            echo "| Image | $IMAGE_URI |"
+            echo "| Digest | ${{ steps.image.outputs.digest }} |"
+            echo "| Signature storage | OCI signature in Amazon ECR |"
+            echo "| Result | **$STATUS** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" = failed ]; then
+            exit 1
+          fi

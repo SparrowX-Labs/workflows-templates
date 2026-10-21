@@ -1,0 +1,199 @@
+name: Deployed API Test
+
+on:
+  workflow_call:
+    inputs:
+      base-url:
+        description: Base URL of the deployed service
+        required: true
+        type: string
+      runtime:
+        description: Test runtime
+        required: true
+        type: string
+      test-command:
+        description: Repository-owned command that runs the deployed API tests
+        required: true
+        type: string
+      test-path:
+        description: Path included in the test summary
+        required: true
+        type: string
+      python-version:
+        description: Python version for Python API tests
+        required: false
+        default: '3.12'
+        type: string
+      node-version:
+        description: Node.js version for Node API tests
+        required: false
+        default: '22'
+        type: string
+      requirements-file:
+        description: Python dependency file
+        required: false
+        default: requirements-dev.txt
+        type: string
+
+    outputs:
+      status:
+        description: Overall API test status
+        value: ${{ jobs.python-api-test.outputs.status || jobs.node-api-test.outputs.status }}
+      passed:
+        description: Number of API tests that passed
+        value: ${{ jobs.python-api-test.outputs.passed || jobs.node-api-test.outputs.passed }}
+      total:
+        description: Total number of API tests
+        value: ${{ jobs.python-api-test.outputs.total || jobs.node-api-test.outputs.total }}
+
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: ${{ inputs.base-url }}
+  TEST_COMMAND: ${{ inputs.test-command }}
+  TEST_PATH: ${{ inputs.test-path }}
+  REQUIREMENTS_FILE: ${{ inputs.requirements-file }}
+
+jobs:
+  python-api-test:
+    name: Python deployed API tests
+    if: inputs.runtime == 'python'
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      passed: ${{ steps.result.outputs.passed }}
+      total: ${{ steps.result.outputs.total }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r "$REQUIREMENTS_FILE"
+
+      - name: Run deployed API tests
+        run: |
+          set +e
+          $TEST_COMMAND 2>&1 | tee api-test-output.txt
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          printf '%s\n' "$TEST_EXIT_CODE" > api-test-exit-code.txt
+          exit 0
+
+      - name: Record API test result
+        id: result
+        if: always()
+        run: |
+          passed=$(grep -Eo '[0-9]+ passed' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          failed=$(grep -Eo '[0-9]+ failed' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          errors=$(grep -Eo '[0-9]+ error(s)?' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          skipped=$(grep -Eo '[0-9]+ skipped' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          xfailed=$(grep -Eo '[0-9]+ xfailed' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          xpassed=$(grep -Eo '[0-9]+ xpassed' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+
+          passed=${passed:-0}
+          failed=${failed:-0}
+          errors=${errors:-0}
+          skipped=${skipped:-0}
+          xfailed=${xfailed:-0}
+          xpassed=${xpassed:-0}
+          total=$((passed + failed + errors + skipped + xfailed + xpassed))
+
+          if [ "$(cat api-test-exit-code.txt 2>/dev/null || echo 1)" -eq 0 ]; then
+            status=passed
+          else
+            status=failed
+          fi
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+      - name: Add API test summary
+        if: always()
+        run: |
+          {
+            echo "## Deployed API Tests"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Runtime | \`python\` |"
+            echo "| Base URL | \`${BASE_URL}\` |"
+            echo "| Test path | \`${TEST_PATH}\` |"
+            echo "| Status | \`${{ steps.result.outputs.status }}\` |"
+            echo "| Tests passed | \`${{ steps.result.outputs.passed }}/${{ steps.result.outputs.total }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  node-api-test:
+    name: Node.js deployed API tests
+    if: inputs.runtime == 'node'
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      passed: ${{ steps.result.outputs.passed }}
+      total: ${{ steps.result.outputs.total }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run deployed API tests
+        run: |
+          set +e
+          $TEST_COMMAND 2>&1 | tee api-test-output.txt
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
+          printf '%s\n' "$TEST_EXIT_CODE" > api-test-exit-code.txt
+          exit 0
+
+      - name: Record API test result
+        id: result
+        if: always()
+        run: |
+          passed=$(grep -Eo '[0-9]+ passed' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          failed=$(grep -Eo '[0-9]+ failed' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          total=$(grep -Eo '[0-9]+ total' api-test-output.txt 2>/dev/null | tail -1 | awk '{print $1}' || true)
+          passed=${passed:-0}
+          failed=${failed:-0}
+          total=${total:-$((passed + failed))}
+
+          if [ "$(cat api-test-exit-code.txt 2>/dev/null || echo 1)" -eq 0 ]; then
+            status=passed
+          else
+            status=failed
+          fi
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+      - name: Add API test summary
+        if: always()
+        run: |
+          {
+            echo "## Deployed API Tests"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Runtime | \`node\` |"
+            echo "| Base URL | \`${BASE_URL}\` |"
+            echo "| Test path | \`${TEST_PATH}\` |"
+            echo "| Status | \`${{ steps.result.outputs.status }}\` |"
+            echo "| Tests passed | \`${{ steps.result.outputs.passed }}/${{ steps.result.outputs.total }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

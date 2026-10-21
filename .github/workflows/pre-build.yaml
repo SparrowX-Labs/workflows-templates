@@ -1,0 +1,170 @@
+name: Pre-Build
+
+on:
+  workflow_call:
+    inputs:
+      env-params-file:
+        description: Path to the ECS parameters file
+        required: true
+        type: string
+    outputs:
+      build-needed:
+        description: Whether a new image needs to be built
+        value: ${{ jobs.pre-build.outputs.build-needed }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}  
+
+jobs:
+
+  pre-build:
+    runs-on: ubuntu-latest
+
+    outputs:
+      build-needed: ${{ steps.build-check.outputs.needed }}
+      deploy-needed: ${{ steps.filter.outputs.deploy }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # Detect changes
+      # ==========================================================
+
+      - name: Detect changed files
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - 'Dockerfile'
+
+      # ==========================================================
+      # Only needed when there are NO code changes
+      # ==========================================================
+
+      - name: Load configuration
+        if: steps.filter.outputs.code == 'false'
+        run: |
+          echo "SERVICE_NAME=$(yq -r '.service.name' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
+
+          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.image.nameSpace' $ENV_PARAMS_FILE)/$(yq -r '.image.repository' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
+
+          echo "ECS_CLUSTER=$(yq -r '.project.name' $ENV_PARAMS_FILE)-$(yq -r '.project.environment' $ENV_PARAMS_FILE)-cluster" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        if: steps.filter.outputs.code == 'false'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # ==========================================================
+      # Determine whether a new image is needed
+      # ==========================================================
+
+      - name: Determine if build is needed
+        id: build-check
+        run: |
+
+          # Code changes always require a new image.
+          if [ "${{ steps.filter.outputs.code }}" = "true" ]; then
+            echo "Code changed. New image is needed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Code changes detected." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # No code changes → check whether the currently deployed image still exists.
+
+          # Check whether the ECS service exists.
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$SERVICE_NAME" \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || true)
+
+          if [ "$SERVICE_STATUS" != "ACTIVE" ]; then
+            echo "ECS service does not exist. New image is needed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "reason=ECS service does not exist." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get the currently deployed task definition.
+          TASK_DEFINITION=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$SERVICE_NAME" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          # Get the image currently used by the service.
+          IMAGE=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION" \
+            --query 'taskDefinition.containerDefinitions[0].image' \
+            --output text)
+
+          echo "Currently deployed image: $IMAGE"
+
+          # Extract the image tag.
+          IMAGE_TAG="${IMAGE##*:}"
+
+          # Check whether that exact image still exists in ECR.
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY_FULL_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            >/dev/null 2>&1; then
+
+            echo "Currently deployed image exists in ECR."
+            echo "New image is not needed."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=No code changes and the currently deployed image exists in ECR." >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "Currently deployed image does not exist in ECR."
+            echo "New image is needed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+             echo "reason=No code changes, but the currently deployed image no longer exists in ECR." >> "$GITHUB_OUTPUT"
+
+          fi
+      
+      - name: Add pre-build summary
+        if: always()
+        run: |
+          CODE_CHANGED="${{ steps.filter.outputs.code }}"
+          BUILD_NEEDED="${{ steps.build-check.outputs.needed }}"
+          REASON="${{ steps.build-check.outputs.reason }}"
+
+          if [ "$CODE_CHANGED" = "true" ]; then
+            CODE_STATUS="Yes"
+          else
+            CODE_STATUS="No"
+          fi
+
+          if [ "$BUILD_NEEDED" = "true" ]; then
+            BUILD_STATUS="Yes"
+          elif [ "$BUILD_NEEDED" = "false" ]; then
+            BUILD_STATUS="No"
+          else
+            BUILD_STATUS="Unknown"
+          fi
+
+          {
+            echo "## Pre-Build"
+            echo
+            echo "| Item | Result |"
+            echo "|---|---|"
+            echo "| Code changes | **$CODE_STATUS** |"
+            echo "| Build needed | **$BUILD_STATUS** |"
+            echo "| Reason | $REASON |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,193 @@
+name: PR Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      source-security-artifact:
+        description: Source security report artifact
+        required: true
+        type: string
+      security-policy-file:
+        description: Repository path to the application security policy file
+        required: true
+        type: string
+    outputs:
+      status:
+        description: Quality gate status
+        value: ${{ jobs.pr-quality-gate.outputs.status }}
+
+permissions:
+  contents: read
+
+env:
+  RESULTS_DIR: quality-gate-results
+
+jobs:
+  pr-quality-gate:
+    name: PR Security Quality Gate
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Configure quality gate policy
+        env:
+          SECURITY_POLICY_FILE: ${{ inputs.security-policy-file }}
+        run: |
+
+          if [ ! -f "$SECURITY_POLICY_FILE" ]; then
+            echo "Security policy file was not found: $SECURITY_POLICY_FILE"
+            exit 1
+          fi
+
+          BLOCK_ON_SECRET_FINDINGS=$(yq -r '.secret_scanning.block_on_findings // ""' "$SECURITY_POLICY_FILE")
+          MAX_SAST_FINDINGS=$(yq -r '.sast.max_findings // ""' "$SECURITY_POLICY_FILE")
+
+
+          if [ "$BLOCK_ON_SECRET_FINDINGS" != true ] && [ "$BLOCK_ON_SECRET_FINDINGS" != false ]; then
+            echo "Invalid secret_scanning.block_on_findings policy value."
+            exit 1
+          fi
+          if ! [[ "$MAX_SAST_FINDINGS" =~ ^[0-9]+$ ]]; then
+            echo "Invalid sast.max_findings policy value."
+            exit 1
+          fi
+
+
+          {
+            echo "BLOCK_ON_SECRET_FINDINGS=$BLOCK_ON_SECRET_FINDINGS"
+            echo "MAX_SAST_FINDINGS=$MAX_SAST_FINDINGS"
+            echo "POLICY_STATUS=loaded"
+          } >> "$GITHUB_ENV"
+
+      - name: Download source security reports
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.source-security-artifact }}
+          path: security-reports/source
+
+      - name: Initialize evaluation state
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          : > "$RESULTS_DIR/failures.txt"
+          {
+            echo "SECRET_STATUS=error"
+            echo "SECRET_FINDINGS=0"
+            echo "SAST_STATUS=error"
+            echo "SAST_FINDINGS=0"
+          } >> "$GITHUB_ENV"
+
+      - name: Evaluate secret scanning
+        if: always()
+        run: |
+          REPORT=security-reports/source/combined-source-security-scan-results.json
+
+          if [ ! -s "$REPORT" ] || ! jq empty "$REPORT"; then
+            echo "Secret scanning combined report is missing or invalid." >> "$RESULTS_DIR/failures.txt"
+            exit 0
+          fi
+
+          STATUS=$(jq -r '.secretScanning.status // "error"' "$REPORT")
+          FINDINGS=$(jq -r '.secretScanning.findings // 0' "$REPORT")
+          {
+            echo "SECRET_STATUS=$STATUS"
+            echo "SECRET_FINDINGS=$FINDINGS"
+          } >> "$GITHUB_ENV"
+
+          if [ "$STATUS" = error ]; then
+            echo "Secret scanning did not complete successfully." >> "$RESULTS_DIR/failures.txt"
+          elif [ "$BLOCK_ON_SECRET_FINDINGS" = true ] && [ "$FINDINGS" -gt 0 ]; then
+            echo "Secret scanning reported $FINDINGS finding(s)." >> "$RESULTS_DIR/failures.txt"
+          fi
+
+      - name: Evaluate SAST
+        if: always()
+        run: |
+          REPORT=security-reports/source/combined-source-security-scan-results.json
+
+          if [ ! -s "$REPORT" ] || ! jq empty "$REPORT"; then
+            echo "SAST combined report is missing or invalid." >> "$RESULTS_DIR/failures.txt"
+            exit 0
+          fi
+
+          STATUS=$(jq -r '.sast.status // "error"' "$REPORT")
+          FINDINGS=$(jq -r '.sast.findings // 0' "$REPORT")
+          {
+            echo "SAST_STATUS=$STATUS"
+            echo "SAST_FINDINGS=$FINDINGS"
+          } >> "$GITHUB_ENV"
+
+          if [ "$STATUS" = error ]; then
+            echo "SAST did not complete successfully." >> "$RESULTS_DIR/failures.txt"
+          elif [ "$FINDINGS" -gt "$MAX_SAST_FINDINGS" ]; then
+            echo "SAST reported $FINDINGS finding(s); maximum is $MAX_SAST_FINDINGS." >> "$RESULTS_DIR/failures.txt"
+          fi
+
+      - name: Write quality gate summary
+        id: summary
+        if: always()
+        run: |
+          if [ "$POLICY_STATUS" != loaded ] || [ -s "$RESULTS_DIR/failures.txt" ]; then
+            GATE_STATUS=failed
+            GATE_RESULT="**FAILED** — PR security policy requirements were not satisfied."
+          else
+            GATE_STATUS=passed
+            GATE_RESULT="**PASSED** — PR security policy requirements were satisfied."
+          fi
+
+          echo "status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
+
+          ARTIFACTS_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
+          SOURCE_ARTIFACT="${{ inputs.source-security-artifact }}"
+
+          report_link() {
+            REPORT_NAME="$1"
+            ARTIFACT_NAME="$2"
+            echo "[\`$REPORT_NAME\`]($ARTIFACTS_URL \"Download $ARTIFACT_NAME\")"
+          }
+
+          {
+            echo "## PR Security Quality Gate"
+            echo
+            echo "### Gate result"
+            echo
+            echo "$GATE_RESULT"
+            echo
+            echo "| Gate | Result |"
+            echo "|---|---|"
+            echo "| Overall PR security gate | **$GATE_STATUS** |"
+            echo
+
+            if [ "$GATE_STATUS" = failed ]; then
+              echo "### Failure reasons"
+              echo
+              if [ "$POLICY_STATUS" != loaded ]; then
+                echo "- Security policy could not be loaded from '${{ inputs.security-policy-file }}'."
+              fi
+              while IFS= read -r failure; do
+                echo "- $failure"
+              done < "$RESULTS_DIR/failures.txt"
+              echo
+            fi
+
+            echo "### Security scan results"
+            echo
+            echo "| Security control | Status | Findings / details | JSON report |"
+            echo "|---|---|---:|---|"
+            echo "| Secret scanning | ${SECRET_STATUS:-error} | ${SECRET_FINDINGS:-0} | $(report_link trivy-secret-results.json "$SOURCE_ARTIFACT") |"
+            echo "| SAST | ${SAST_STATUS:-error} | ${SAST_FINDINGS:-0} | $(report_link semgrep-results.json "$SOURCE_ARTIFACT") |"
+            echo "Combined source report: $(report_link combined-source-security-scan-results.json "$SOURCE_ARTIFACT")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$GATE_STATUS" = failed ]; then
+            exit 1
+          fi

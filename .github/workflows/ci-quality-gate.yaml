@@ -1,0 +1,250 @@
+name: CI Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      image-security-artifact:
+        description: Image security report artifact
+        required: true
+        type: string
+      security-policy-file:
+        description: Repository path to the application security policy file
+        required: true
+        type: string
+    outputs:
+      status:
+        description: Quality gate status
+        value: ${{ jobs.ci-quality-gate.outputs.status }}
+
+permissions:
+  contents: read
+
+env:
+  RESULTS_DIR: quality-gate-results
+
+jobs:
+  ci-quality-gate:
+    name: CI Security Quality Gate
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Configure quality gate policy
+        env:
+          SECURITY_POLICY_FILE: ${{ inputs.security-policy-file }}
+        run: |
+
+          if [ ! -f "$SECURITY_POLICY_FILE" ]; then
+            echo "Security policy file was not found: $SECURITY_POLICY_FILE"
+            exit 1
+          fi
+
+          MAX_IMAGE_CRITICAL=$(yq -r '.image_scan.max_critical // ""' "$SECURITY_POLICY_FILE")
+          MAX_IMAGE_HIGH=$(yq -r '.image_scan.max_high // ""' "$SECURITY_POLICY_FILE")
+          REQUIRE_SBOM=$(yq -r '.sbom.required // ""' "$SECURITY_POLICY_FILE")
+
+          if ! [[ "$MAX_IMAGE_CRITICAL" =~ ^[0-9]+$ ]]; then
+            echo "Invalid image_scan.max_critical policy value."
+            exit 1
+          fi
+          if ! [[ "$MAX_IMAGE_HIGH" =~ ^[0-9]+$ ]]; then
+            echo "Invalid image_scan.max_high policy value."
+            exit 1
+          fi
+          if [ "$REQUIRE_SBOM" != true ] && [ "$REQUIRE_SBOM" != false ]; then
+            echo "Invalid sbom.required policy value."
+            exit 1
+          fi
+
+          {
+            echo "MAX_IMAGE_CRITICAL=$MAX_IMAGE_CRITICAL"
+            echo "MAX_IMAGE_HIGH=$MAX_IMAGE_HIGH"
+            echo "REQUIRE_SBOM=$REQUIRE_SBOM"
+            echo "POLICY_STATUS=loaded"
+          } >> "$GITHUB_ENV"
+
+      - name: Download image security reports
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.image-security-artifact }}
+          path: security-reports/image
+
+      - name: Initialize evaluation state
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          : > "$RESULTS_DIR/failures.txt"
+          : > "$RESULTS_DIR/image-failures.txt"
+          {
+            echo "IMAGE_STATUS=error"
+            echo "IMAGE_SCAN_STATUS=error"
+            echo "IMAGE_TOTAL=0"
+            echo "IMAGE_CRITICAL=0"
+            echo "IMAGE_HIGH=0"
+            echo "SBOM_STATUS=error"
+            echo "SBOM_COMPONENTS=0"
+          } >> "$GITHUB_ENV"
+
+      - name: Evaluate image scanning
+        if: always()
+        run: |
+          REPORT=security-reports/image/combined-image-security-scan-results.json
+
+          image_failure() {
+            echo "$1" >> "$RESULTS_DIR/failures.txt"
+            echo "$1" >> "$RESULTS_DIR/image-failures.txt"
+          }
+
+          if [ ! -s "$REPORT" ] || ! jq empty "$REPORT"; then
+            image_failure "Image security combined report is missing or invalid."
+            exit 0
+          fi
+
+          STATUS=$(jq -r '.status // "error"' "$REPORT")
+          SCAN_STATUS=$(jq -r '.imageScan.status // "error"' "$REPORT")
+          TOTAL=$(jq -r '.imageScan.total // 0' "$REPORT")
+          CRITICAL=$(jq -r '.imageScan.critical // 0' "$REPORT")
+          HIGH=$(jq -r '.imageScan.high // 0' "$REPORT")
+          {
+            echo "IMAGE_STATUS=$STATUS"
+            echo "IMAGE_SCAN_STATUS=$SCAN_STATUS"
+            echo "IMAGE_TOTAL=$TOTAL"
+            echo "IMAGE_CRITICAL=$CRITICAL"
+            echo "IMAGE_HIGH=$HIGH"
+          } >> "$GITHUB_ENV"
+
+          if [ "$STATUS" = error ] || [ "$SCAN_STATUS" = error ]; then
+            image_failure "Image scanning did not complete successfully."
+          fi
+          if [ "$CRITICAL" -gt "$MAX_IMAGE_CRITICAL" ]; then
+            image_failure "Image scanning reported $CRITICAL CRITICAL finding(s); maximum is $MAX_IMAGE_CRITICAL."
+          fi
+          if [ "$HIGH" -gt "$MAX_IMAGE_HIGH" ]; then
+            image_failure "Image scanning reported $HIGH HIGH finding(s); maximum is $MAX_IMAGE_HIGH."
+          fi
+
+          RAW_REPORT=security-reports/image/trivy-results.json
+          if [ ! -s "$RAW_REPORT" ] || ! jq empty "$RAW_REPORT"; then
+            image_failure "Image scan JSON report is missing or invalid."
+            exit 0
+          fi
+
+          REPORT_TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$RAW_REPORT")
+          REPORT_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' "$RAW_REPORT")
+          REPORT_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' "$RAW_REPORT")
+          if [ "$TOTAL" -ne "$REPORT_TOTAL" ]; then
+            image_failure "Image scan total count does not match its combined report."
+          fi
+          if [ "$CRITICAL" -ne "$REPORT_CRITICAL" ]; then
+            image_failure "Image scan CRITICAL count does not match its combined report."
+          fi
+          if [ "$HIGH" -ne "$REPORT_HIGH" ]; then
+            image_failure "Image scan HIGH count does not match its combined report."
+          fi
+
+      - name: Evaluate SBOM
+        if: always()
+        run: |
+          REPORT=security-reports/image/combined-image-security-scan-results.json
+
+          sbom_failure() {
+            echo "$1" >> "$RESULTS_DIR/failures.txt"
+            echo "$1" >> "$RESULTS_DIR/image-failures.txt"
+          }
+
+          if [ ! -s "$REPORT" ] || ! jq empty "$REPORT"; then
+            sbom_failure "SBOM combined report is missing or invalid."
+            exit 0
+          fi
+
+          STATUS=$(jq -r '.sbom.status // "error"' "$REPORT")
+          COMPONENTS=$(jq -r '.sbom.components // 0' "$REPORT")
+          {
+            echo "SBOM_STATUS=$STATUS"
+            echo "SBOM_COMPONENTS=$COMPONENTS"
+          } >> "$GITHUB_ENV"
+
+          if [ "$REQUIRE_SBOM" = true ] && [ "$STATUS" != generated ]; then
+            sbom_failure "SBOM status is '$STATUS', expected generated."
+          fi
+
+          RAW_REPORT=security-reports/image/sbom.cdx.json
+          if [ ! -s "$RAW_REPORT" ] || ! jq empty "$RAW_REPORT"; then
+            sbom_failure "SBOM JSON report is missing or invalid."
+          fi
+
+      - name: Write quality gate summary
+        id: summary
+        if: always()
+        run: |
+          if [ "$POLICY_STATUS" != loaded ] || [ -s "$RESULTS_DIR/failures.txt" ]; then
+            GATE_STATUS=failed
+            GATE_RESULT="**FAILED** — CI security policy requirements were not satisfied."
+          else
+            GATE_STATUS=passed
+            GATE_RESULT="**PASSED** — CI security policy requirements were satisfied."
+          fi
+
+          if [ -s "$RESULTS_DIR/image-failures.txt" ]; then
+            IMAGE_GATE_STATUS=failed
+          else
+            IMAGE_GATE_STATUS=passed
+          fi
+          echo "status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
+
+          ARTIFACTS_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
+          IMAGE_ARTIFACT="${{ inputs.image-security-artifact }}"
+
+          report_link() {
+            REPORT_NAME="$1"
+            ARTIFACT_NAME="$2"
+            echo "[\`$REPORT_NAME\`]($ARTIFACTS_URL \"Download $ARTIFACT_NAME\")"
+          }
+
+          {
+            echo "## CI Security Quality Gate"
+            echo
+            echo "### Gate result"
+            echo
+            echo "$GATE_RESULT"
+            echo
+            echo "| Gate | Result |"
+            echo "|---|---|"
+            echo "| Overall CI security gate | **$GATE_STATUS** |"
+            echo "| Image security gate | **$IMAGE_GATE_STATUS** |"
+            echo
+
+            if [ "$GATE_STATUS" = failed ]; then
+              echo "### Failure reasons"
+              echo
+              if [ "$POLICY_STATUS" != loaded ]; then
+                echo "- Security policy could not be loaded from '${{ inputs.security-policy-file }}'."
+              fi
+              while IFS= read -r failure; do
+                echo "- $failure"
+              done < "$RESULTS_DIR/failures.txt"
+              echo
+            fi
+
+            echo "### Security scan results"
+            echo
+            echo "| Security control | Status | Findings / details | JSON report |"
+            echo "|---|---|---:|---|"
+            echo "| Image scan | ${IMAGE_SCAN_STATUS:-error} | ${IMAGE_TOTAL:-0} (${IMAGE_CRITICAL:-0} CRITICAL, ${IMAGE_HIGH:-0} HIGH) | $(report_link trivy-results.json "$IMAGE_ARTIFACT") |"
+            echo "| SBOM | ${SBOM_STATUS:-error} | ${SBOM_COMPONENTS:-0} component(s) | $(report_link sbom.cdx.json "$IMAGE_ARTIFACT") |"
+            echo
+            echo "Combined image report: $(report_link combined-image-security-scan-results.json "$IMAGE_ARTIFACT")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$GATE_STATUS" = failed ]; then
+            exit 1
+          fi

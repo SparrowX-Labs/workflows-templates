@@ -1,0 +1,177 @@
+name: Image Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      env-params-file:
+        description: Path to the ECS parameters file
+        required: true
+        type: string
+      image-tag:
+        description: Image tag to scan
+        required: true
+        type: string
+    outputs:
+      artifact-name:
+        description: Image security report artifact
+        value: ${{ jobs.image-security-scan.outputs.artifact-name }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
+  IMAGE_TAG: ${{ inputs.image-tag }}
+
+jobs:
+  image-security-scan:
+    name: Image Security Scan
+    runs-on: ubuntu-latest
+
+    outputs:
+      artifact-name: ${{ steps.artifact-name.outputs.artifact-name }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Prepare report directory
+        run: mkdir -p image-security-reports
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Load image configuration
+        run: |
+          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.image.nameSpace' "$ENV_PARAMS_FILE")/$(yq -r '.image.repository' "$ENV_PARAMS_FILE")" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_FULL_NAME }}:${{ env.IMAGE_TAG }}
+          format: json
+          output: image-security-reports/trivy-results.json
+          exit-code: '0'
+          ignore-unfixed: false
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_FULL_NAME }}:${{ env.IMAGE_TAG }}
+          format: cyclonedx
+          output: image-security-reports/sbom.cdx.json
+          exit-code: '0'
+
+      - name: Create image security report
+        if: always()
+        run: |
+          IMAGE_STATUS=error
+          IMAGE_TOTAL=0
+          IMAGE_CRITICAL=0
+          IMAGE_HIGH=0
+          SBOM_STATUS=error
+          SBOM_COMPONENTS=0
+
+          if [ -s image-security-reports/trivy-results.json ] && \
+            jq empty image-security-reports/trivy-results.json; then
+            IMAGE_TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' \
+              image-security-reports/trivy-results.json)
+            IMAGE_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' \
+              image-security-reports/trivy-results.json)
+            IMAGE_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' \
+              image-security-reports/trivy-results.json)
+            IMAGE_STATUS=passed
+            if [ "$IMAGE_TOTAL" -gt 0 ]; then
+              IMAGE_STATUS=findings
+            fi
+          fi
+
+          if [ -s image-security-reports/sbom.cdx.json ] && \
+            jq empty image-security-reports/sbom.cdx.json; then
+            SBOM_COMPONENTS=$(jq '[.components[]?] | length' \
+              image-security-reports/sbom.cdx.json)
+            SBOM_STATUS=generated
+          fi
+
+          OVERALL_STATUS=passed
+          if [ "$IMAGE_STATUS" = error ] || [ "$SBOM_STATUS" = error ]; then
+            OVERALL_STATUS=error
+          elif [ "$IMAGE_STATUS" = findings ]; then
+            OVERALL_STATUS=findings
+          fi
+
+          jq -n \
+            --arg status "$OVERALL_STATUS" \
+            --arg tag "$IMAGE_TAG" \
+            --arg image_status "$IMAGE_STATUS" \
+            --argjson image_total "$IMAGE_TOTAL" \
+            --argjson image_critical "$IMAGE_CRITICAL" \
+            --argjson image_high "$IMAGE_HIGH" \
+            --arg sbom_status "$SBOM_STATUS" \
+            --argjson sbom_components "$SBOM_COMPONENTS" \
+            '{
+              schemaVersion: 1,
+              status: $status,
+              image: {
+                tag: $tag
+              },
+              imageScan: {
+                status: $image_status,
+                total: $image_total,
+                critical: $image_critical,
+                high: $image_high,
+                report: "trivy-results.json"
+              },
+              sbom: {
+                status: $sbom_status,
+                format: "cyclonedx-json",
+                components: $sbom_components,
+                report: "sbom.cdx.json"
+              }
+            }' > image-security-reports/combined-image-security-scan-results.json
+
+          {
+            echo "## Image Security Scan"
+            echo
+            echo "| Control | Status | Details |"
+            echo "|---|---|---|"
+            echo "| Image scan | $IMAGE_STATUS | $IMAGE_TOTAL finding(s) ($IMAGE_CRITICAL CRITICAL, $IMAGE_HIGH HIGH) |"
+            echo "| SBOM | $SBOM_STATUS | $SBOM_COMPONENTS component(s) |"
+            echo "| Image | $ECR_REPOSITORY_FULL_NAME:$IMAGE_TAG | Immutable commit tag |"
+            echo
+            echo "Report artifact: image-security-${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$OVERALL_STATUS" = error ]; then
+            exit 1
+          fi
+
+      - name: Upload image security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-security-${{ github.run_id }}
+          path: |
+            image-security-reports/combined-image-security-scan-results.json
+            image-security-reports/trivy-results.json
+            image-security-reports/sbom.cdx.json
+          if-no-files-found: error
+
+      - name: Set report artifact output
+        id: artifact-name
+        if: always()
+        run: echo "artifact-name=image-security-${{ github.run_id }}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,67 @@
+name: Production Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      smoke-test-status:
+        description: Status returned by the smoke-test workflow
+        required: true
+        type: string
+      api-test-status:
+        description: Status returned by the API-test workflow
+        required: true
+        type: string
+      api-test-blocking:
+        description: Whether an API-test failure blocks the production quality gate
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      status:
+        description: Production validation status
+        value: ${{ jobs.prod-quality-gate.outputs.status }}
+
+permissions:
+  contents: read
+
+jobs:
+  prod-quality-gate:
+    name: Production Quality Gate
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.evaluate.outputs.status }}
+
+    steps:
+      - name: Evaluate production tests
+        id: evaluate
+        env:
+          SMOKE_STATUS: ${{ inputs.smoke-test-status }}
+          API_STATUS: ${{ inputs.api-test-status }}
+          API_TEST_BLOCKING: ${{ inputs.api-test-blocking }}
+        run: |
+          if [ "$SMOKE_STATUS" = passed ] && { [ "$API_STATUS" = passed ] || [ "$API_TEST_BLOCKING" = false ]; }; then
+            GATE_STATUS=passed
+            GATE_RESULT="**PASSED** — blocking production checks passed."
+          else
+            GATE_STATUS=failed
+            GATE_RESULT="**FAILED** — blocking production checks did not pass."
+          fi
+
+          echo "status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Production Quality Gate"
+            echo
+            echo "$GATE_RESULT"
+            echo
+            echo "| Check | Status | Mode |"
+            echo "|---|---|---:|"
+            echo "| Smoke test | ${SMOKE_STATUS:-failed} | blocking |"
+            API_TEST_MODE=$([ "$API_TEST_BLOCKING" = true ] && echo blocking || echo advisory)
+            echo "| API tests | ${API_STATUS:-failed} | $API_TEST_MODE |"
+            if [ "$API_TEST_BLOCKING" = false ] && [ "$API_STATUS" != passed ]; then
+              echo
+              echo "> API tests are advisory and did not block this production decision."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

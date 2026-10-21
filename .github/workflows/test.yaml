@@ -1,0 +1,104 @@
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      env-params-file:
+        description: Path to the ECS parameters file
+        required: true
+        type: string
+
+      runtime:
+        description: Test runtime
+        required: true
+        type: string
+
+      python-version:
+        description: Python version
+        required: false
+        type: string
+        default: '3.12'
+
+      node-version:
+        description: Node.js version
+        required: false
+        type: string
+        default: '22'
+
+      database:
+        description: Whether PostgreSQL is required
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
+
+jobs:
+  python-test:
+    name: Python
+    if: inputs.runtime == 'python'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Load image configuration
+        run: |
+          echo "DB_NAME=$(yq -r '.database.name' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
+
+      - name: Start PostgreSQL
+        if: inputs.database
+        run: |
+          docker run --detach \
+            --name test-postgres \
+            --env POSTGRES_USER=postgres \
+            --env POSTGRES_PASSWORD=postgres \
+            --env POSTGRES_DB=$DB_NAME \
+            --publish 5433:5432 \
+            postgres:16-alpine
+
+          for attempt in {1..30}; do
+            docker exec test-postgres \
+              pg_isready -U postgres -d $DB_NAME && exit 0
+            sleep 2
+          done
+
+          exit 1
+
+      - name: Run tests
+        run: pytest tests
+
+  node-test:
+    name: Node.js
+    if: inputs.runtime == 'node'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --run

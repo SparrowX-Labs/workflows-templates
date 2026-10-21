@@ -1,0 +1,210 @@
+name: Dev Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      dast-artifact:
+        description: DAST report artifact
+        required: true
+        type: string
+      security-policy-file:
+        description: Repository path to the application security policy file
+        required: true
+        type: string
+      smoke-test-status:
+        description: Status returned by the smoke-test workflow
+        required: true
+        type: string
+      api-test-status:
+        description: Status returned by the API-test workflow
+        required: true
+        type: string
+      api-test-blocking:
+        description: Whether an API-test failure blocks the development quality gate
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      status:
+        description: Development security quality gate status
+        value: ${{ jobs.dev-quality-gate.outputs.status }}
+
+permissions:
+  contents: read
+
+env:
+  RESULTS_DIR: dev-quality-gate-results
+  API_TEST_BLOCKING: ${{ inputs.api-test-blocking }}
+
+jobs:
+  dev-quality-gate:
+    name: Development Security Quality Gate
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+
+    steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Configure development security policy
+        env:
+          SECURITY_POLICY_FILE: ${{ inputs.security-policy-file }}
+        run: |
+          if [ ! -f "$SECURITY_POLICY_FILE" ]; then
+            echo "Security policy file was not found: $SECURITY_POLICY_FILE"
+            exit 1
+          fi
+
+          MAX_DAST_HIGH=$(yq -r '.dast.max_high // ""' "$SECURITY_POLICY_FILE")
+          MAX_DAST_MEDIUM=$(yq -r '.dast.max_medium // ""' "$SECURITY_POLICY_FILE")
+
+          if ! [[ "$MAX_DAST_HIGH" =~ ^[0-9]+$ ]]; then
+            echo "Invalid dast.max_high policy value."
+            exit 1
+          fi
+          if ! [[ "$MAX_DAST_MEDIUM" =~ ^[0-9]+$ ]]; then
+            echo "Invalid dast.max_medium policy value."
+            exit 1
+          fi
+
+          {
+            echo "MAX_DAST_HIGH=$MAX_DAST_HIGH"
+            echo "MAX_DAST_MEDIUM=$MAX_DAST_MEDIUM"
+            echo "POLICY_STATUS=loaded"
+          } >> "$GITHUB_ENV"
+
+      - name: Download DAST reports
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.dast-artifact }}
+          path: dast-reports
+
+      - name: Initialize evaluation state
+        if: always()
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          : > "$RESULTS_DIR/failures.txt"
+          : > "$RESULTS_DIR/warnings.txt"
+          {
+            echo "DAST_STATUS=error"
+            echo "DAST_FINDINGS=0"
+            echo "DAST_HIGH=0"
+            echo "DAST_MEDIUM=0"
+            echo "SMOKE_TEST_STATUS=${{ inputs.smoke-test-status }}"
+            echo "API_TEST_STATUS=${{ inputs.api-test-status }}"
+            echo "API_TEST_BLOCKING=${{ inputs.api-test-blocking }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Evaluate deployment tests
+        if: always()
+        run: |
+          if [ "$SMOKE_TEST_STATUS" != passed ]; then
+            echo "Smoke test status was '$SMOKE_TEST_STATUS'; expected passed." >> "$RESULTS_DIR/failures.txt"
+          fi
+          if [ "$API_TEST_STATUS" != passed ]; then
+            if [ "$API_TEST_BLOCKING" = true ]; then
+              echo "API test status was '$API_TEST_STATUS'; expected passed." >> "$RESULTS_DIR/failures.txt"
+            else
+              echo "API test status was '$API_TEST_STATUS'; recorded as advisory." >> "$RESULTS_DIR/warnings.txt"
+            fi
+          fi
+
+      - name: Evaluate DAST
+        if: always()
+        run: |
+          REPORT=dast-reports/combined-dast-results.json
+          RAW_REPORT=dast-reports/zap-results.json
+
+          if [ ! -s "$REPORT" ] || ! jq empty "$REPORT"; then
+            echo "DAST combined report is missing or invalid." >> "$RESULTS_DIR/failures.txt"
+            exit 0
+          fi
+          if [ ! -s "$RAW_REPORT" ] || ! jq empty "$RAW_REPORT"; then
+            echo "DAST ZAP report is missing or invalid." >> "$RESULTS_DIR/failures.txt"
+            exit 0
+          fi
+
+          STATUS=$(jq -r '.status // "error"' "$REPORT")
+          FINDINGS=$(jq -r '.scan.findings // 0' "$REPORT")
+          HIGH=$(jq -r '.scan.high // 0' "$REPORT")
+          MEDIUM=$(jq -r '.scan.medium // 0' "$REPORT")
+          REPORT_FINDINGS=$(jq '[.site[]?.alerts[]?] | length' "$RAW_REPORT")
+          REPORT_HIGH=$(jq '[.site[]?.alerts[]? | select((.riskcode | tonumber) == 3)] | length' "$RAW_REPORT")
+          REPORT_MEDIUM=$(jq '[.site[]?.alerts[]? | select((.riskcode | tonumber) == 2)] | length' "$RAW_REPORT")
+
+          {
+            echo "DAST_STATUS=$STATUS"
+            echo "DAST_FINDINGS=$FINDINGS"
+            echo "DAST_HIGH=$HIGH"
+            echo "DAST_MEDIUM=$MEDIUM"
+          } >> "$GITHUB_ENV"
+
+          if [ "$STATUS" = error ]; then
+            echo "DAST scan did not complete successfully." >> "$RESULTS_DIR/failures.txt"
+          fi
+          if [ "$FINDINGS" -ne "$REPORT_FINDINGS" ] || \
+            [ "$HIGH" -ne "$REPORT_HIGH" ] || [ "$MEDIUM" -ne "$REPORT_MEDIUM" ]; then
+            echo "DAST combined counts do not match the raw ZAP report." >> "$RESULTS_DIR/failures.txt"
+          fi
+          if [ "$HIGH" -gt "$MAX_DAST_HIGH" ]; then
+            echo "DAST reported $HIGH HIGH finding(s); maximum is $MAX_DAST_HIGH." >> "$RESULTS_DIR/failures.txt"
+          fi
+          if [ "$MEDIUM" -gt "$MAX_DAST_MEDIUM" ]; then
+            echo "DAST reported $MEDIUM MEDIUM finding(s); maximum is $MAX_DAST_MEDIUM." >> "$RESULTS_DIR/failures.txt"
+          fi
+
+      - name: Write development quality gate summary
+        id: summary
+        if: always()
+        run: |
+          if [ "$POLICY_STATUS" != loaded ] || [ -s "$RESULTS_DIR/failures.txt" ]; then
+            GATE_STATUS=failed
+            GATE_RESULT="**FAILED** — blocking deployment tests and/or DAST policy requirements were not satisfied."
+          else
+            GATE_STATUS=passed
+            GATE_RESULT="**PASSED** — blocking checks and DAST policy requirements were satisfied."
+          fi
+          echo "status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
+
+          ARTIFACTS_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
+          DAST_ARTIFACT="${{ inputs.dast-artifact }}"
+
+          {
+            echo "## Dev Quality Gate"
+            echo
+            echo "### Gate result"
+            echo
+            echo "$GATE_RESULT"
+            echo
+            echo "| Control | Status | Findings | Report |"
+            echo "|---|---|---:|---|"
+            echo "| Smoke test | ${SMOKE_TEST_STATUS:-failed} | — | — |"
+            API_TEST_MODE=$([ "$API_TEST_BLOCKING" = true ] && echo blocking || echo advisory)
+            echo "| API tests | ${API_TEST_STATUS:-failed} | $API_TEST_MODE | — |"
+            echo "| DAST | ${DAST_STATUS:-error} | ${DAST_FINDINGS:-0} (${DAST_HIGH:-0} HIGH, ${DAST_MEDIUM:-0} MEDIUM) | [combined-dast-results.json]($ARTIFACTS_URL) |"
+            echo
+            if [ -s "$RESULTS_DIR/warnings.txt" ]; then
+              echo "### Advisory warnings"
+              echo
+              while IFS= read -r warning; do
+                echo "- $warning"
+              done < "$RESULTS_DIR/warnings.txt"
+            fi
+            if [ "$GATE_STATUS" = failed ]; then
+              echo "### Failure reasons"
+              echo
+              while IFS= read -r failure; do
+                echo "- $failure"
+              done < "$RESULTS_DIR/failures.txt"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$GATE_STATUS" = failed ]; then
+            exit 1
+          fi

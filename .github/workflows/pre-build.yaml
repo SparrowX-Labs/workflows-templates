@@ -26,9 +26,8 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      # build-needed: ${{ steps.build-check.outputs.needed }}
-      build-needed: ${{ steps.filtr.outputs.code }}
-
+      build-needed: ${{ steps.build-check.outputs.needed }}
+      
     steps:
 
       - name: Checkout
@@ -47,94 +46,92 @@ jobs:
               - 'src/**'
               - 'tests/**'
               - 'Dockerfile'
-
-      # Will update check logic later
-      
+    
       # ==========================================================
       # Only needed when there are NO code changes
       # ==========================================================
 
-      # - name: Load configuration
-      #   if: steps.filter.outputs.code == 'false'
-      #   run: |
-      #     echo "SERVICE_NAME=$(yq -r '.serviceName' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
+      - name: Load configuration
+        if: steps.filter.outputs.code == 'false'
+        run: |
+          echo "SERVICE_NAME=$(yq -r '.serviceName' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
 
-      #     echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.projectName' $ENV_PARAMS_FILE)/$(yq -r '.environment' $ENV_PARAMS_FILE)/$(yq -r '.serviceName' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.projectName' $ENV_PARAMS_FILE)/$(yq -r '.environment' $ENV_PARAMS_FILE)/$(yq -r '.serviceName' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
 
-      #     echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
 
-      # - name: Configure AWS credentials
-      #   if: steps.filter.outputs.code == 'false'
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
-      #     aws-region: ${{ vars.AWS_REGION }}
+      - name: Configure AWS credentials
+        if: steps.filter.outputs.code == 'false'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       # ==========================================================
       # Determine whether a new image is needed
       # ==========================================================
 
-      # - name: Determine if build is needed
-      #   id: build-check
-      #   run: |
+      - name: Determine if build is needed
+        id: build-check
+        run: |
 
-      #     # Code changes always require a new image.
-      #     if [ "${{ steps.filter.outputs.code }}" = "true" ]; then
-      #       echo "Code changed. New image is needed."
-      #       echo "needed=true" >> "$GITHUB_OUTPUT"
-      #       echo "reason=Code changes detected." >> "$GITHUB_OUTPUT"
-      #       exit 0
-      #     fi
+          # Code changes always require a new image.
+          if [ "${{ steps.filter.outputs.code }}" = "true" ]; then
+            echo "Code changed. New image is needed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Code changes detected." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-      #     # No code changes → check whether the currently deployed image still exists.
+          # No code changes → check whether the currently deployed image still exists.
 
-      #     # Check whether with the same exact tag already exists in ECR.
-      #     if aws ecr describe-images \
-      #       --repository-name "$ECR_REPOSITORY_FULL_NAME" \
-      #       --image-ids imageTag="$IMAGE_TAG" \
-      #       >/dev/null 2>&1; then
+          # Check whether with the same exact tag already exists in ECR.
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY_FULL_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            >/dev/null 2>&1; then
 
-      #       echo "Currently deployed image exists in ECR."
-      #       echo "New image is not needed."
-      #       echo "needed=false" >> "$GITHUB_OUTPUT"
-      #       echo "reason=No code changes and the currently deployed image exists in ECR." >> "$GITHUB_OUTPUT"
+            echo "Currently deployed image exists in ECR."
+            echo "New image is not needed."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=No code changes and the currently deployed image exists in ECR." >> "$GITHUB_OUTPUT"
 
-      #     else
+          else
 
-      #       echo "Currently deployed image does not exist in ECR."
-      #       echo "New image is needed."
-      #       echo "needed=true" >> "$GITHUB_OUTPUT"
-      #        echo "reason=No code changes, but the currently deployed image no longer exists in ECR." >> "$GITHUB_OUTPUT"
+            echo "Currently deployed image does not exist in ECR."
+            echo "New image is needed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+             echo "reason=No code changes, but the currently deployed image no longer exists in ECR." >> "$GITHUB_OUTPUT"
 
-      #     fi
+          fi
       
-      # - name: Add pre-build summary
-      #   if: always()
-      #   run: |
-      #     CODE_CHANGED="${{ steps.filter.outputs.code }}"
-      #     BUILD_NEEDED="${{ steps.build-check.outputs.needed }}"
-      #     REASON="${{ steps.build-check.outputs.reason }}"
+      - name: Add pre-build summary
+        if: always()
+        run: |
+          CODE_CHANGED="${{ steps.filter.outputs.code }}"
+          BUILD_NEEDED="${{ steps.build-check.outputs.needed }}"
+          REASON="${{ steps.build-check.outputs.reason }}"
 
-      #     if [ "$CODE_CHANGED" = "true" ]; then
-      #       CODE_STATUS="Yes"
-      #     else
-      #       CODE_STATUS="No"
-      #     fi
+          if [ "$CODE_CHANGED" = "true" ]; then
+            CODE_STATUS="Yes"
+          else
+            CODE_STATUS="No"
+          fi
 
-      #     if [ "$BUILD_NEEDED" = "true" ]; then
-      #       BUILD_STATUS="Yes"
-      #     elif [ "$BUILD_NEEDED" = "false" ]; then
-      #       BUILD_STATUS="No"
-      #     else
-      #       BUILD_STATUS="Unknown"
-      #     fi
+          if [ "$BUILD_NEEDED" = "true" ]; then
+            BUILD_STATUS="Yes"
+          elif [ "$BUILD_NEEDED" = "false" ]; then
+            BUILD_STATUS="No"
+          else
+            BUILD_STATUS="Unknown"
+          fi
 
-      #     {
-      #       echo "## Pre-Build"
-      #       echo
-      #       echo "| Item | Result |"
-      #       echo "|---|---|"
-      #       echo "| Code changes | **$CODE_STATUS** |"
-      #       echo "| Build needed | **$BUILD_STATUS** |"
-      #       echo "| Reason | $REASON |"
-      #     } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Pre-Build"
+            echo
+            echo "| Item | Result |"
+            echo "|---|---|"
+            echo "| Code changes | **$CODE_STATUS** |"
+            echo "| Build needed | **$BUILD_STATUS** |"
+            echo "| Reason | $REASON |"
+          } >> "$GITHUB_STEP_SUMMARY"

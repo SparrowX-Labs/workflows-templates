@@ -152,35 +152,35 @@ jobs:
           if tag_exists "$TARGET_TAG"; then
             delete_tag "$TARGET_TAG"
           fi
-
+          
           # Get digest before copying
           SOURCE_DIGEST=$(aws ecr describe-images \
-          --repository-name "$REPOSITORY" \
-          --image-ids "imageTag=$source_tag" \
-          --query 'imageDetails[0].imageDigest' \
-          --output text)
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=$ORIGIN_TAG" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
 
-
-          # Assign the destination tag to the origin image.
+          # Assign the destination tag to the origin image
           copy_tag "$ORIGIN_TAG" "$TARGET_TAG"
 
           # Get digest after copying
-
           TARGET_DIGEST=$(aws ecr describe-images \
-          --repository-name "$REPOSITORY" \
-          --image-ids "imageTag=$destination_tag" \
-          --query 'imageDetails[0].imageDigest' \
-          --output text)
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=$TARGET_TAG" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
 
-          # Verify integrity of digest after copying
+          # Verify the digest remains unchanged
           if [[ "$TARGET_DIGEST" != "$SOURCE_DIGEST" ]]; then
-            echo "Digest Integity Check Failed, Digest Changed After Copying"
+            echo "::error::Digest integrity check failed. Digest changed after copying."
             exit 1
           else
             echo "Digest Integiry Check Passed!"
             
             IMAGE_DIGEST=$TARGET_DIGEST
-            IMAGE_URI="${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY_FULL_NAMEY@$IMAGE_DIGEST"
+            IMAGE_URI="${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY_FULL_NAME@$IMAGE_DIGEST"
             
             echo "IMAGE_DIGEST=${IMAGE_DIGEST}" >> "$GITHUB_ENV"
             echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"

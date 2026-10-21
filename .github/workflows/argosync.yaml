@@ -67,6 +67,9 @@ jobs:
           echo "Values file: $ENV_PARAMS_FILE"
           echo "Image tag: $IMAGE_TAG"
 
+      - name: Checkout application
+        uses: actions/checkout@v4
+
       - name: Install yq
         uses: mikefarah/yq@v4.48.2
 

@@ -29,7 +29,7 @@ env:
 
 jobs:
   publish:
-    name: Publish Image Metadata
+    name: Promote Image
     runs-on: ubuntu-latest
 
     steps:

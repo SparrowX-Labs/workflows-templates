@@ -89,24 +89,29 @@ jobs:
             local manifest_file
 
             manifest_file="$(mktemp)"
-            trap 'rm -f "$manifest_file"' RETURN
 
-            aws ecr batch-get-image \
+            if ! aws ecr batch-get-image \
               --repository-name "$REPOSITORY" \
               --image-ids "imageTag=$source_tag" \
               --region "$AWS_REGION" \
-              --output json |
-              jq -er '.images[0].imageManifest' > "$manifest_file"
+              --query 'images[0].imageManifest' \
+              --output text > "$manifest_file"; then
+              rm -f "$manifest_file"
+              echo "::error::Failed to retrieve manifest for tag $source_tag"
+              return 1
+            fi
 
-            aws ecr put-image \
+            if ! aws ecr put-image \
               --repository-name "$REPOSITORY" \
               --image-tag "$destination_tag" \
               --image-manifest "file://$manifest_file" \
-              --region "$AWS_REGION"
+              --region "$AWS_REGION"; then
+              rm -f "$manifest_file"
+              echo "::error::Failed to create tag $destination_tag"
+              return 1
+            fi
 
             rm -f "$manifest_file"
-            trap - RETURN
-
             echo "Copied $source_tag -> $destination_tag"
           }
 

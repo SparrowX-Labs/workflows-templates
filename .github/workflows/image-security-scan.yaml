@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       env-params-file:
-        description: Path to the ECS parameters file
+        description: Path to the Helm Values file
         required: true
         type: string
       image-tag:
@@ -45,7 +45,7 @@ jobs:
 
       - name: Load image configuration
         run: |
-          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.image.nameSpace' "$ENV_PARAMS_FILE")/$(yq -r '.image.repository' "$ENV_PARAMS_FILE")" >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.projectName' $ENV_PARAMS_FILE)/$(yq -r '.environment' $ENV_PARAMS_FILE)/$(yq -r '.serviceName' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4

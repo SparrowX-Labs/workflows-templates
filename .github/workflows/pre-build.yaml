@@ -55,11 +55,11 @@ jobs:
       - name: Load configuration
         if: steps.filter.outputs.code == 'false'
         run: |
-          echo "SERVICE_NAME=$(yq -r '.service.name' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
+          echo "SERVICE_NAME=$(yq -r '.serviceName' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
 
-          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.image.nameSpace' $ENV_PARAMS_FILE)/$(yq -r '.image.repository' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.projectName' $ENV_PARAMS_FILE)/$(yq -r '.environment' $ENV_PARAMS_FILE)/$(yq -r '.serviceName' $ENV_PARAMS_FILE)" >> "$GITHUB_ENV"
 
-          echo "ECS_CLUSTER=$(yq -r '.project.name' $ENV_PARAMS_FILE)-$(yq -r '.project.environment' $ENV_PARAMS_FILE)-cluster" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         if: steps.filter.outputs.code == 'false'
@@ -86,39 +86,7 @@ jobs:
 
           # No code changes → check whether the currently deployed image still exists.
 
-          # Check whether the ECS service exists.
-          SERVICE_STATUS=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$SERVICE_NAME" \
-            --query 'services[0].status' \
-            --output text 2>/dev/null || true)
-
-          if [ "$SERVICE_STATUS" != "ACTIVE" ]; then
-            echo "ECS service does not exist. New image is needed."
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-            echo "reason=ECS service does not exist." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Get the currently deployed task definition.
-          TASK_DEFINITION=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$SERVICE_NAME" \
-            --query 'services[0].taskDefinition' \
-            --output text)
-
-          # Get the image currently used by the service.
-          IMAGE=$(aws ecs describe-task-definition \
-            --task-definition "$TASK_DEFINITION" \
-            --query 'taskDefinition.containerDefinitions[0].image' \
-            --output text)
-
-          echo "Currently deployed image: $IMAGE"
-
-          # Extract the image tag.
-          IMAGE_TAG="${IMAGE##*:}"
-
-          # Check whether that exact image still exists in ECR.
+          # Check whether with the same exact tag already exists in ECR.
           if aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY_FULL_NAME" \
             --image-ids imageTag="$IMAGE_TAG" \

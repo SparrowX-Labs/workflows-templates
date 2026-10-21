@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       env-params-file:
-        description: Path to the ECS parameters file
+        description: Path to the Helm Values file
         required: true
         type: string
 

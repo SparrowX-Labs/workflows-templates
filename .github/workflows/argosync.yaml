@@ -88,6 +88,30 @@ jobs:
             --auth-token ${{ secrets.ARGOCD_AUTH_TOKEN }}
             --grpc-web
 
+      - name: Wait for any active sync operation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..120}; do
+            phase="$(argocd app get "$APP_NAME" \
+              --server "$ARGOCD_SERVER" \
+              --auth-token "$ARGOCD_AUTH_TOKEN" \
+              --grpc-web \
+              -o json | jq -r '.status.operationState.phase // "Idle"')"
+
+            if [[ "$phase" != "Running" ]]; then
+              echo "No active operation (last phase: $phase)"
+              exit 0
+            fi
+
+            echo "An Argo CD operation is already running; waiting 5 seconds (attempt $attempt/120)"
+            sleep 5
+          done
+
+          echo "Timed out waiting for the existing Argo CD operation"
+          exit 1
+
       - name: Set image tag
         uses: clowdhaus/argo-cd-action@v4.2.0 
         with:
@@ -102,16 +126,38 @@ jobs:
             --helm-set-string image.tag=${{ env.IMAGE_TAG }}
 
 
-      - name: Sync application
-        uses: clowdhaus/argo-cd-action@v4.2.0 
-        with:
-          version: 2.14.11
-          command: app sync ${{ env.APP_NAME }}
-          options: >-
-            --server ${{ secrets.ARGOCD_SERVER }}
-            --auth-token ${{ secrets.ARGOCD_AUTH_TOKEN }}
-            --grpc-web
-            --timeout 600
+      - name: Sync application with retry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..12}; do
+            set +e
+            output="$(argocd app sync "$APP_NAME" \
+              --server "$ARGOCD_SERVER" \
+              --auth-token "$ARGOCD_AUTH_TOKEN" \
+              --grpc-web \
+              --timeout 600 2>&1)"
+            status=$?
+            set -e
+
+            echo "$output"
+
+            if [[ "$status" -eq 0 ]]; then
+              exit 0
+            fi
+
+            if grep -Eiq 'another operation is already in progress|operation.*in progress' <<< "$output"; then
+              echo "Argo CD is busy; waiting 10 seconds before retry $attempt/12"
+              sleep 10
+              continue
+            fi
+
+            exit "$status"
+          done
+
+          echo "Timed out retrying Argo CD sync"
+          exit 1
 
       - name: Wait for application health
         uses: clowdhaus/argo-cd-action@v4.2.0

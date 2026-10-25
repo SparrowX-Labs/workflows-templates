@@ -3,14 +3,18 @@ name: Verify Image Signature
 on:
   workflow_call:
     inputs:
-      image-uri:
-        description: Full immutable ECR image URI in registry/repository@sha256:digest format    
+      env-params-file:
+        description: Application environment values file containing projectName, environment, and serviceName
+        required: true
+        type: string
+      image-tag:
+        description: ECR image tag to resolve and verify
         required: true
         type: string
       certificate-identity-regexp:
         description: Expected Sigstore certificate identity regular expression
         required: false
-        default: '^https://github\.com/SparrowX-ECS/workflows-templates/\.github/workflows/sign-image\.yaml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+        default: '^https://github\.com/SparrowX-Labs/workflows-templates/\.github/workflows/sign-image\.yaml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
         type: string
       certificate-oidc-issuer:
         description: Expected OIDC issuer in the signing certificate
@@ -28,7 +32,8 @@ permissions:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  IMAGE_URI: ${{ inputs.image-uri }}
+  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
+  IMAGE_TAG: ${{ inputs.image-tag }}
 
 jobs:
   verify-image-signature:
@@ -39,6 +44,16 @@ jobs:
       status: ${{ steps.summary.outputs.status }}
 
     steps:
+      - name: Checkout application
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.48.2
+
+      - name: Load image configuration
+        run: |
+          echo "ECR_REPOSITORY_FULL_NAME=$(yq -r '.projectName' "$ENV_PARAMS_FILE")/$(yq -r '.environment' "$ENV_PARAMS_FILE")/$(yq -r '.serviceName' "$ENV_PARAMS_FILE")" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -48,6 +63,24 @@ jobs:
       - name: Login to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image tag
+        run: |
+          set -euo pipefail
+
+          IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY_FULL_NAME" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
+
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Could not resolve a valid digest for image tag '$IMAGE_TAG': $IMAGE_DIGEST"
+            exit 1
+          fi
+
+          echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY_FULL_NAME@$IMAGE_DIGEST" >> "$GITHUB_ENV"
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
@@ -62,7 +95,7 @@ jobs:
           case "$IMAGE_URI" in
             *@sha256:*) ;;
             *)
-              echo "image-uri must use registry/repository@sha256:digest format."
+              echo "Resolved image URI must use registry/repository@sha256:digest format."
               exit 1
               ;;
           esac
@@ -90,6 +123,7 @@ jobs:
             echo "| Item | Value |"
             echo "|---|---|"
             echo "| Tool | Cosign |"
+            echo "| Image tag | $IMAGE_TAG |"
             echo "| Image | $IMAGE_URI |"
             echo "| Certificate identity | ${{ inputs.certificate-identity-regexp }} |"
             echo "| OIDC issuer | ${{ inputs.certificate-oidc-issuer }} |"

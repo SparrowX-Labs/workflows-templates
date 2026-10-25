@@ -11,10 +11,6 @@ on:
         description: Repository path to the application security policy file
         required: true
         type: string
-      smoke-test-status:
-        description: Status returned by the smoke-test workflow
-        required: true
-        type: string
       api-test-status:
         description: Status returned by the API-test workflow
         required: true
@@ -96,7 +92,6 @@ jobs:
             echo "DAST_FINDINGS=0"
             echo "DAST_HIGH=0"
             echo "DAST_MEDIUM=0"
-            echo "SMOKE_TEST_STATUS=${{ inputs.smoke-test-status }}"
             echo "API_TEST_STATUS=${{ inputs.api-test-status }}"
             echo "API_TEST_BLOCKING=${{ inputs.api-test-blocking }}"
           } >> "$GITHUB_ENV"
@@ -104,9 +99,6 @@ jobs:
       - name: Evaluate deployment tests
         if: always()
         run: |
-          if [ "$SMOKE_TEST_STATUS" != passed ]; then
-            echo "Smoke test status was '$SMOKE_TEST_STATUS'; expected passed." >> "$RESULTS_DIR/failures.txt"
-          fi
           if [ "$API_TEST_STATUS" != passed ]; then
             if [ "$API_TEST_BLOCKING" = true ]; then
               echo "API test status was '$API_TEST_STATUS'; expected passed." >> "$RESULTS_DIR/failures.txt"
@@ -184,7 +176,6 @@ jobs:
             echo
             echo "| Control | Status | Findings | Report |"
             echo "|---|---|---:|---|"
-            echo "| Smoke test | ${SMOKE_TEST_STATUS:-failed} | — | — |"
             API_TEST_MODE=$([ "$API_TEST_BLOCKING" = true ] && echo blocking || echo advisory)
             echo "| API tests | ${API_TEST_STATUS:-failed} | $API_TEST_MODE | — |"
             echo "| DAST | ${DAST_STATUS:-error} | ${DAST_FINDINGS:-0} (${DAST_HIGH:-0} HIGH, ${DAST_MEDIUM:-0} MEDIUM) | [combined-dast-results.json]($ARTIFACTS_URL) |"

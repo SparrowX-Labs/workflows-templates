@@ -3,12 +3,12 @@ name: Smoke Test
 on:
   workflow_call:
     inputs:
-      env-params-file:
-        description: Path to the Helm Values file
-        required: true
-        type: string
       base-url:
         description: Base URL of the deployed service
+        required: true
+        type: string
+      health-path:
+        description: Health endpoint path appended to the base URL
         required: true
         type: string
       timeout:
@@ -32,8 +32,8 @@ permissions:
   contents: read
 
 env:
-  ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
   BASE_URL: ${{ inputs.base-url }}
+  HEALTH_PATH: ${{ inputs.health-path }}
   TIMEOUT: ${{ inputs.timeout }}
 
 jobs:
@@ -47,19 +47,9 @@ jobs:
       total: ${{ steps.result.outputs.total }}
 
     steps:
-      - name: Checkout application
-        uses: actions/checkout@v4
-
-      - name: Install yq
-        uses: mikefarah/yq@v4.48.2
-
-      - name: Load health check configuration
-        run: |
-          echo "SMOKE_TEST_PATH=$(yq -r '.loadBalancer.smokeTestPath' "$ENV_PARAMS_FILE")" >> "$GITHUB_ENV"
-
       - name: Run smoke test
         run: |
-          URL="${BASE_URL%/}${SMOKE_TEST_PATH}"
+          URL="${BASE_URL%/}${HEALTH_PATH}"
 
           echo "Testing: $URL"
           echo "Waiting up to ${TIMEOUT}s for the service to become healthy..."
@@ -102,7 +92,7 @@ jobs:
           done
 
           printf '%s\n' "$TEST_EXIT_CODE" > smoke-test-exit-code.txt
-          exit 0
+          exit "$TEST_EXIT_CODE"
 
       - name: Record smoke test result
         id: result
@@ -128,7 +118,7 @@ jobs:
             echo
             echo "| Item | Value |"
             echo "|---|---|"
-            echo "| Endpoint | \`${BASE_URL}${SMOKE_TEST_PATH}\` |"
+            echo "| Endpoint | \`${BASE_URL}${HEALTH_PATH}\` |"
             echo "| Timeout | \`${TIMEOUT}s\` |"
             echo "| Method | \`GET\` |"
             echo "| Status | \`${{ steps.result.outputs.status }}\` |"

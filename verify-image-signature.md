@@ -11,15 +11,15 @@ Verifies that an ECR image has a valid Cosign keyless signature and that the sig
 ```yaml
 jobs:
   verify-image-signature:
-    needs: [resolve-image]
     uses: SparrowX-ECS/workflows-templates/.github/workflows/verify-image-signature.yaml@<version>
     with:
-      image-uri: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/platform/customer-api@sha256:<digest>
+      env-params-file: helm-values-dev.yaml
+      image-tag: dev-candidate
       certificate-identity-regexp: >-
         https://github.com/SparrowX-ECS/.*/.github/workflows/.*@refs/heads/main
 ```
 
-The caller should construct this URI from the resolved repository and digest. Do not pass a tag or a URI containing `:` followed by a tag.
+The workflow resolves the supplied tag to its current ECR digest and verifies the immutable `registry/repository@sha256:digest` URI. It does not verify a mutable tag directly.
 
 The identity expression must be restricted to the trusted organization, repository, and workflow that are allowed to sign images. Do not use `.*` for the entire identity in a production caller.
 
@@ -27,7 +27,8 @@ The identity expression must be restricted to the trusted organization, reposito
 
 | Input | Required | Description |
 |---|---:|---|
-| `image-uri` | yes | Full immutable ECR URI in `registry/repository@sha256:digest` format |
+| `env-params-file` | yes | Application values file containing `projectName`, `environment`, and `serviceName` |
+| `image-tag` | yes | ECR image tag to resolve and verify |
 | `certificate-identity-regexp` | yes | Expected Sigstore certificate identity regular expression |
 | `certificate-oidc-issuer` | no | Expected issuer; defaults to `https://token.actions.githubusercontent.com` |
 
@@ -57,6 +58,7 @@ The summary has this shape:
 The workflow executes:
 
 ```bash
+aws ecr describe-images --repository-name <repository> --image-ids imageTag=<tag>
 cosign verify <registry/repository@sha256:digest> \
   --certificate-identity-regexp '<trusted-identity-regexp>' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'

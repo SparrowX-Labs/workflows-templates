@@ -237,12 +237,9 @@ jobs:
             echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
           fi
 
-          # Preserve the original Git SHA tag permanently.
-          if [[ "$ORIGIN_TAG" != "$GIT_IMAGE_TAG" ]]; then
-            delete_tag "$ORIGIN_TAG"
-          else
-            echo "Keeping the original Git SHA tag: $GIT_IMAGE_TAG"
-          fi
+          # Preserve the origin tag. This keeps dev-candidate, prod-candidate,
+          # and Git SHA tags available for verification and safe reruns.
+          echo "Keeping the origin tag: $ORIGIN_TAG"
 
           echo "Promotion completed: $TARGET_TAG"
 

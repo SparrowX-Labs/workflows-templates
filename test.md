@@ -4,7 +4,7 @@ Reusable workflow: `.github/workflows/test.yaml`
 
 ## Purpose
 
-Runs the application’s repository test suite for Python or Node projects. Python services can optionally run against a temporary PostgreSQL container.
+Runs the application’s repository test suite in one job for Python or Node projects. Runtime-specific setup and test steps are selected conditionally. Python services can optionally run against a temporary PostgreSQL container.
 
 ## Usage
 

@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       env-params-file:
-        description: Path to the ECS parameters file
+        description: Path to the Helm Values file
         required: true
         type: string
     outputs:
@@ -85,23 +85,23 @@ jobs:
 
           # No code changes → check whether the currently deployed image still exists.
 
-          # Check whether with the same exact tag already exists in ECR.
+          # Check whether with image with git-sha tag already exists in ECR.
           if aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY_FULL_NAME" \
             --image-ids imageTag="$IMAGE_TAG" \
             >/dev/null 2>&1; then
 
-            echo "Currently deployed image exists in ECR."
+            echo "Image with git-sha tag already exists in ECR."
             echo "New image is not needed."
             echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "reason=No code changes and the currently deployed image exists in ECR." >> "$GITHUB_OUTPUT"
+            echo "reason=No code changes and image with git-sha tag already exists in ECR" >> "$GITHUB_OUTPUT"
 
           else
 
-            echo "Currently deployed image does not exist in ECR."
+            echo "No image with git-sha exist in ECR."
             echo "New image is needed."
             echo "needed=true" >> "$GITHUB_OUTPUT"
-             echo "reason=No code changes, but the currently deployed image no longer exists in ECR." >> "$GITHUB_OUTPUT"
+             echo "reason=No code changes, no image with this git-sha tag in ECR" >> "$GITHUB_OUTPUT"
 
           fi
       

@@ -78,8 +78,11 @@ jobs:
             exit 1
           fi
 
+          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
           echo "SOURCE_ECR_REPOSITORY=$SOURCE_ECR_REPOSITORY" >> "$GITHUB_ENV"
           echo "TARGET_ECR_REPOSITORY=$TARGET_ECR_REPOSITORY" >> "$GITHUB_ENV"
+          echo "ECR_REGISTRY=$ECR_REGISTRY" >> "$GITHUB_ENV"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -114,8 +117,6 @@ jobs:
 
       - name: Login to ECR
         run: |
-          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
           ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
 
           # Skopeo and ORAS use different credential stores by default.
@@ -133,15 +134,19 @@ jobs:
 
       - name: Resolve Source Image Tag
         run: |
+          set -euo pipefail
+
           IMAGE_DETAILS=$(aws ecr describe-images \
             --repository-name "$SOURCE_ECR_REPOSITORY" \
             --image-ids "imageTag=$SOURCE_IMAGE_TAG" \
             --region "$AWS_REGION" \
-            --query "imageDetails[0].[imageDigest, imageTags[?@!='$SOURCE_IMAGE_TAG'] | [0]]" \
-            --output text)
+            --query 'imageDetails[0]' \
+            --output json)
 
-          SOURCE_IMAGE_DIGEST=$(awk '{print $1}' <<< "$IMAGE_DETAILS")
-          GIT_SHA_IMAGE_TAG=$(awk '{print $2}' <<< "$IMAGE_DETAILS")
+          SOURCE_IMAGE_DIGEST=$(jq -r '.imageDigest // empty' <<< "$IMAGE_DETAILS")
+          GIT_SHA_IMAGE_TAG=$(jq -r --arg source_tag "$SOURCE_IMAGE_TAG" \
+            '.imageTags[]? | select(. != $source_tag and test("^[0-9a-fA-F]{40}$"))' \
+            <<< "$IMAGE_DETAILS" | head -n 1)
 
           if [[ -z "$SOURCE_IMAGE_DIGEST" || "$SOURCE_IMAGE_DIGEST" == "None" ]]; then
             echo "::error::Could not resolve source image tag: $SOURCE_IMAGE_TAG"
@@ -159,10 +164,89 @@ jobs:
           echo "Source image digest: $SOURCE_IMAGE_DIGEST"
           echo "Original Git SHA tag: $GIT_SHA_IMAGE_TAG"
 
-      # Copy Image with origin git-sha-image-tag       
-      - name: Copy image to target ECR
+      - name: Check target image state
+        id: target-state
         run: |
-          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          set -euo pipefail
+
+          image_digest() {
+            local result
+            if result="$(aws ecr describe-images \
+              --repository-name "$TARGET_ECR_REPOSITORY" \
+              --image-ids "$1" \
+              --region "$AWS_REGION" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text 2>&1)"; then
+              printf '%s' "$result"
+            elif [[ "$result" == *ImageNotFoundException* ]]; then
+              return 0
+            else
+              printf '%s\n' "$result" >&2
+              return 1
+            fi
+          }
+
+          source_digest="$(image_digest "imageDigest=$SOURCE_IMAGE_DIGEST")"
+          git_sha_digest="$(image_digest "imageTag=$GIT_SHA_IMAGE_TAG")"
+          target_tag_digest="$(image_digest "imageTag=$TARGET_IMAGE_TAG")"
+
+          if [[ "$source_digest" == "$SOURCE_IMAGE_DIGEST" && \
+                "$git_sha_digest" == "$SOURCE_IMAGE_DIGEST" ]]; then
+            needed_action=skip
+          elif [[ "$source_digest" == "$SOURCE_IMAGE_DIGEST" ]]; then
+            needed_action=cleanup
+          elif [[ -n "$git_sha_digest" ]]; then
+            echo "::error::Target tag '$GIT_SHA_IMAGE_TAG' exists without source digest '$SOURCE_IMAGE_DIGEST'; target state is corrupted."
+            exit 1
+          else
+            needed_action=proceed
+          fi
+
+          echo "needed-action=$needed_action" >> "$GITHUB_OUTPUT"
+          echo "target-tag-matches=$([[ "$target_tag_digest" == "$SOURCE_IMAGE_DIGEST" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "target-tag-exists=$([[ -n "$target_tag_digest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Target state: $needed_action"
+
+      - name: Cleanup target image state
+        id: cleanup
+        if: steps.target-state.outputs.needed-action != 'skip' || steps.target-state.outputs.target-tag-matches != 'true'
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.target-state.outputs.needed-action }}" = cleanup ]; then
+            echo "Corrupted target state; deleting the digest and its referrers."
+            oras discover --format json "$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$SOURCE_IMAGE_DIGEST" |
+              jq -r '.manifests[]?.digest // empty' |
+              xargs -r -n1 oras manifest delete "$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@" --force
+            aws ecr batch-delete-image \
+              --repository-name "$TARGET_ECR_REPOSITORY" \
+              --image-ids "imageDigest=$SOURCE_IMAGE_DIGEST" \
+              --region "$AWS_REGION" > /dev/null
+            aws ecr batch-delete-image \
+              --repository-name "$TARGET_ECR_REPOSITORY" \
+              --image-ids "imageTag=$GIT_SHA_IMAGE_TAG" \
+              --region "$AWS_REGION" > /dev/null
+          fi
+
+          if [ "${{ steps.target-state.outputs.target-tag-exists }}" = true ] && \
+             [ "${{ steps.target-state.outputs.target-tag-matches }}" != true ]; then
+            aws ecr batch-delete-image \
+              --repository-name "$TARGET_ECR_REPOSITORY" \
+              --image-ids "imageTag=$TARGET_IMAGE_TAG" \
+              --region "$AWS_REGION" > /dev/null
+          fi
+
+          echo "cleanup=done" >> "$GITHUB_OUTPUT"
+
+      - name: Copy image to target ECR
+        if: >
+          steps.target-state.outputs.needed-action == 'proceed' ||
+          (
+            steps.target-state.outputs.needed-action == 'cleanup' &&
+            steps.cleanup.outputs.cleanup == 'done'
+          )
+        run: |
+          set -euo pipefail
 
           SOURCE_IMAGE="docker://$ECR_REGISTRY/$SOURCE_ECR_REPOSITORY@$SOURCE_IMAGE_DIGEST"
           TARGET_IMAGE="docker://$ECR_REGISTRY/$TARGET_ECR_REPOSITORY:$GIT_SHA_IMAGE_TAG"
@@ -178,36 +262,12 @@ jobs:
 
           echo "Image copied successfully."
 
-      # Cleanu-up target-image-tag that's already in use, to assign it to a new image
-      - name: Cleanup previous target image tag
-        run: |
-          set +e
-          describe_output=$(aws ecr describe-images \
-            --repository-name "$TARGET_ECR_REPOSITORY" \
-            --image-ids "imageTag=$TARGET_IMAGE_TAG" \
-            --region "$AWS_REGION" 2>&1)
-          describe_status=$?
-          set -e
-
-          if [ "$describe_status" -eq 0 ]; then
-            echo "Image tag exists. Deleting it..."
-
-            aws ecr batch-delete-image \
-              --repository-name "$TARGET_ECR_REPOSITORY" \
-              --image-ids "imageTag=$TARGET_IMAGE_TAG" \
-              --region "$AWS_REGION"
-
-            echo "Target Image tag cleaned successfully."
-          elif grep -q "ImageNotFoundException" <<< "$describe_output"; then
-            echo "Image tag does not exist; proceeding..."
-          else
-            echo "$describe_output"
-            exit "$describe_status"
-          fi
-
       # Attach target-image-tag to the copied image
-      - name: Add target image tag to target image
+      - name: Add target tag to copied image
+        if: steps.target-state.outputs.target-tag-matches != 'true'
         run: |
+          set -euo pipefail
+
           IMAGE_MANIFEST=$(aws ecr batch-get-image \
             --repository-name "$TARGET_ECR_REPOSITORY" \
             --image-ids "imageTag=$GIT_SHA_IMAGE_TAG" \
@@ -258,43 +318,81 @@ jobs:
 
           echo "Image copied successfully."
 
-      - name: Copy image signature
+      - name: Check target image referrers
+        id: referrers
         run: |
-          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          set -euo pipefail
 
-          SOURCE_IMAGE="$ECR_REGISTRY/$SOURCE_ECR_REPOSITORY@$SOURCE_IMAGE_DIGEST"
           TARGET_IMAGE="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$TARGET_DIGEST"
 
           echo "Inspecting signature referrers for: $TARGET_IMAGE"
 
-          DISCOVER_OUTPUT="$(oras discover \
-            --format json \
-            "$TARGET_IMAGE")"
+          DISCOVER_OUTPUT="$(oras discover --format json "$TARGET_IMAGE")"
 
-          if jq -e \
-            'any(.manifests[]?; .artifactType == "application/vnd.dev.cosign.artifact.sig.v1+json")' \
-            <<< "$DISCOVER_OUTPUT" > /dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Cosign signature already exists; skipping signature copy."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Cosign signature doesn't exist in target repo; it will be copied."
+          signature_exists=false
+          attestation_exists=false
+          signature_digest=""
+          attestation_digest=""
 
-            echo "Copying Cosign signature..."
-            echo "Source: $SOURCE_IMAGE"
-            echo "Target: $TARGET_IMAGE"
+          signature_digest="$(jq -r 'first(.manifests[]? | select(.artifactType == "application/vnd.dev.cosign.artifact.sig.v1+json") | .digest) // empty' <<< "$DISCOVER_OUTPUT")"
+          attestation_digest="$(jq -r 'first(.manifests[]? | select(.artifactType == "application/vnd.dsse.envelope.v1+json") | .digest) // empty' <<< "$DISCOVER_OUTPUT")"
 
-            oras discover "$SOURCE_IMAGE"
+          [ -n "$signature_digest" ] && signature_exists=true
+          [ -n "$attestation_digest" ] && attestation_exists=true
 
-            # Copy the Cosign signature/referrers from source to target.
-            oras cp \
-              "$SOURCE_IMAGE" \
-              "$TARGET_IMAGE" \
-              --recursive
+          echo "signature-exists=$signature_exists" >> "$GITHUB_OUTPUT"
+          echo "attestation-exists=$attestation_exists" >> "$GITHUB_OUTPUT"
+          echo "signature-digest=$signature_digest" >> "$GITHUB_OUTPUT"
+          echo "attestation-digest=$attestation_digest" >> "$GITHUB_OUTPUT"
 
-            echo "Cosign signature copied successfully."
-          fi
-          
+          echo "Target signature exists: $signature_exists"
+          echo "Target SBOM attestation exists: $attestation_exists"
+
+      - name: Cleanup incomplete target referrers
+        if: steps.referrers.outputs.signature-exists != 'true' || steps.referrers.outputs.attestation-exists != 'true'
+        run: |
+          set -euo pipefail
+
+          TARGET_REPOSITORY="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY"
+
+          # A partial referrer set is invalid for this promotion. Remove the
+          # remaining referrers so the recursive copy can recreate both.
+          for referrer_digest in \
+            "${{ steps.referrers.outputs.signature-digest }}" \
+            "${{ steps.referrers.outputs.attestation-digest }}"; do
+            if [ -n "$referrer_digest" ]; then
+              oras manifest delete "$TARGET_REPOSITORY@$referrer_digest" --force
+            fi
+          done
+
+      - name: Copy image referrers
+        if: steps.referrers.outputs.signature-exists != 'true' || steps.referrers.outputs.attestation-exists != 'true'
+        run: |
+          set -euo pipefail
+
+          SOURCE_IMAGE="$ECR_REGISTRY/$SOURCE_ECR_REPOSITORY@$SOURCE_IMAGE_DIGEST"
+          TARGET_IMAGE="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$TARGET_DIGEST"
+
+          echo "Copying signature and SBOM attestation referrers..."
+          oras cp "$SOURCE_IMAGE" "$TARGET_IMAGE" --recursive
+          echo "Image referrers copied successfully."
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Verify target signature and attestation
+        run: |
+          set -euo pipefail
+
+          TARGET_IMAGE="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$TARGET_DIGEST"
+
+          cosign verify "$TARGET_IMAGE" > /dev/null
+          cosign verify-attestation \
+            --type cyclonedx \
+            "$TARGET_IMAGE" > /dev/null
+
+          echo "Target signature and SBOM attestation verified successfully."
+
       - name: Add promotion summary
         if: always()
         run: |

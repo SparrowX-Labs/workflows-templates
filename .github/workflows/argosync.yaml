@@ -42,7 +42,7 @@ jobs:
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-      APP_NAME: ${{ github.event.repository.name }}
+      REPO_NAME: ${{ github.event.repository.name }}
       ENVIRONMENT: ${{ inputs.environment }}
       ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
       IMAGE_TAG: ${{ inputs.image-tag }}
@@ -62,10 +62,16 @@ jobs:
               ;;
           esac
 
-          echo "Application: $APP_NAME"
+          APP_NAME="${REPO_NAME}-${ENVIRONMENT}"
+
+          echo "Application Name: $REPO_NAME"
+          echo "ArgoApp Name: $APP_NAME"
           echo "Environment: $ENVIRONMENT"
           echo "Values file: $ENV_PARAMS_FILE"
           echo "Image tag: $IMAGE_TAG"
+
+          echo APP_NAME="$APP_NAME" >> "$GITHUB_ENV"
+
 
       - name: Checkout application
         uses: actions/checkout@v4

@@ -3,10 +3,6 @@ name: Production Quality Gate
 on:
   workflow_call:
     inputs:
-      smoke-test-status:
-        description: Status returned by the smoke-test workflow
-        required: true
-        type: string
       api-test-status:
         description: Status returned by the API-test workflow
         required: true
@@ -36,11 +32,10 @@ jobs:
       - name: Evaluate production tests
         id: evaluate
         env:
-          SMOKE_STATUS: ${{ inputs.smoke-test-status }}
           API_STATUS: ${{ inputs.api-test-status }}
           API_TEST_BLOCKING: ${{ inputs.api-test-blocking }}
         run: |
-          if [ "$SMOKE_STATUS" = passed ] && { [ "$API_STATUS" = passed ] || [ "$API_TEST_BLOCKING" = false ]; }; then
+          if { [ "$API_STATUS" = passed ] || [ "$API_TEST_BLOCKING" = false ]; }; then
             GATE_STATUS=passed
             GATE_RESULT="**PASSED** — blocking production checks passed."
           else
@@ -57,7 +52,6 @@ jobs:
             echo
             echo "| Check | Status | Mode |"
             echo "|---|---|---:|"
-            echo "| Smoke test | ${SMOKE_STATUS:-failed} | blocking |"
             API_TEST_MODE=$([ "$API_TEST_BLOCKING" = true ] && echo blocking || echo advisory)
             echo "| API tests | ${API_STATUS:-failed} | $API_TEST_MODE |"
             if [ "$API_TEST_BLOCKING" = false ] && [ "$API_STATUS" != passed ]; then

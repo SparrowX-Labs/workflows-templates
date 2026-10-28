@@ -1,0 +1,143 @@
+name: Attest Image
+
+on:
+  workflow_call:
+    inputs:
+      env-params-file:
+        description: Application environment values file
+        required: true
+        type: string
+      image-tag:
+        description: Immutable image URI from sign-image, in registry/repository@sha256:digest format
+        required: true
+        type: string
+      image-security-artifact:
+        description: Artifact containing the generated image security reports and SBOM
+        required: true
+        type: string
+      certificate-identity-regexp:
+        description: Expected Sigstore certificate identity regular expression
+        required: false
+        default: '^https://github\.com/SparrowX-Labs/workflows-templates/\.github/workflows/attest-image\.yaml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+        type: string
+      certificate-oidc-issuer:
+        description: Expected OIDC issuer in the signing certificate
+        required: false
+        default: https://token.actions.githubusercontent.com
+        type: string
+    outputs:
+      status:
+        description: SBOM attestation status
+        value: ${{ jobs.attest-image.outputs.status }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  IMAGE_URI: ${{ inputs.image-tag }}
+
+jobs:
+  attest-image:
+    name: Attest SBOM to Container Image
+    runs-on: ubuntu-latest
+
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+
+    steps:
+      - name: Validate image URI
+        run: |
+          set -euo pipefail
+
+          case "$IMAGE_URI" in
+            *@sha256:*) ;;
+            *)
+              echo "::error::The image input must be an immutable registry/repository@sha256:digest URI."
+              exit 1
+              ;;
+          esac
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download image security reports
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.image-security-artifact }}
+          path: security-reports/image
+
+      - name: Validate SBOM
+        env:
+          SBOM_PATH: security-reports/image/sbom.cdx.json
+        run: |
+          set -euo pipefail
+
+          if [ ! -s "$SBOM_PATH" ] || ! jq empty "$SBOM_PATH"; then
+            echo "::error::The SBOM artifact is missing or invalid."
+            exit 1
+          fi
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Attest SBOM
+        id: attest
+        continue-on-error: true
+        run: |
+          cosign attest \
+            --yes \
+            --predicate security-reports/image/sbom.cdx.json \
+            --type cyclonedx \
+            "$IMAGE_URI"
+
+      - name: Verify SBOM attestation
+        id: verify
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          CERTIFICATE_IDENTITY_REGEXP: ${{ inputs.certificate-identity-regexp }}
+          CERTIFICATE_OIDC_ISSUER: ${{ inputs.certificate-oidc-issuer }}
+        run: |
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity-regexp "$CERTIFICATE_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER" \
+            "$IMAGE_URI"
+
+      - name: Add attestation summary
+        id: summary
+        if: always()
+        env:
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          STATUS=failed
+          if [ "$ATTEST_OUTCOME" = success ] && [ "$VERIFY_OUTCOME" = success ]; then
+            STATUS=passed
+          fi
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Image SBOM Attestation"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Image | $IMAGE_URI |"
+            echo "| Predicate | CycloneDX |"
+            echo "| Attestation | $ATTEST_OUTCOME |"
+            echo "| Verification | $VERIFY_OUTCOME |"
+            echo "| Result | **$STATUS** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" = failed ]; then
+            exit 1
+          fi

@@ -25,6 +25,19 @@ on:
         required: true
         type: string
 
+      certificate-identity-regexp:
+        description: Expected Sigstore certificate identity regular expression
+        required: false
+        default: '^https://github\.com/SparrowX-Labs/workflows-templates/\.github/workflows/attest-image\.yaml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
+        type: string
+
+      certificate-oidc-issuer:
+        description: Expected OIDC issuer in the signing certificate
+        required: false
+        default: https://token.actions.githubusercontent.com
+        type: string
+
+
     
 permissions:
   contents: read
@@ -371,14 +384,22 @@ jobs:
         uses: sigstore/cosign-installer@v4.1.2
 
       - name: Verify target signature and attestation
+        env:
+          CERTIFICATE_IDENTITY_REGEXP: ${{ inputs.certificate-identity-regexp }}
+          CERTIFICATE_OIDC_ISSUER: ${{ inputs.certificate-oidc-issuer }}
         run: |
           set -euo pipefail
 
           TARGET_IMAGE="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$TARGET_DIGEST"
 
-          cosign verify "$TARGET_IMAGE" > /dev/null
+          cosign verify "$TARGET_IMAGE" \
+            --certificate-identity-regexp "$CERTIFICATE_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER"  > /dev/null
+
           cosign verify-attestation \
             --type cyclonedx \
+            --certificate-identity-regexp "$CERTIFICATE_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERTIFICATE_OIDC_ISSUER" \
             "$TARGET_IMAGE" > /dev/null
 
           echo "Target signature and SBOM attestation verified successfully."

@@ -68,6 +68,9 @@ jobs:
             yq -r '.serviceName' "$TARGET_ENV_PARAMS_FILE"
           )"
 
+          echo "SOURCE_ECR_REPOSITORY: '$SOURCE_ECR_REPOSITORY'"
+          echo "TARGET_ECR_REPOSITORY: '$TARGET_ECR_REPOSITORY'"
+
           if [ -z "$SOURCE_ECR_REPOSITORY" ] || [ "$SOURCE_ECR_REPOSITORY" = "null/null" ]; then
             echo "ERROR: Source ECR repository could not be resolved."
             exit 1

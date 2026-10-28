@@ -1,4 +1,3 @@
-
 name: Argo CD Sync
 
 on:
@@ -32,6 +31,7 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   ENV_PARAMS_FILE: ${{ inputs.env-params-file }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   argosync:
@@ -85,7 +85,7 @@ jobs:
           echo "ECR_REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_ENV"
           
       - name: Verify Argo CD access
-        uses: clowdhaus/argo-cd-action@v4.2.0 
+        uses: clowdhaus/argo-cd-action@v4.2.0
         with:
           version: 2.14.11
           command: app get ${{ env.APP_NAME }}

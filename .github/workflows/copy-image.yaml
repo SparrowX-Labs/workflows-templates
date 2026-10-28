@@ -52,21 +52,8 @@ jobs:
 
       - name: Load ECR repositories
         run: |
-          SOURCE_ECR_REPOSITORY="$(
-            yq -r '.projectName' "$SOURCE_ENV_PARAMS_FILE"
-          )/$(
-            yq -r '.environment' "$SOURCE_ENV_PARAMS_FILE"
-          )"/$(
-            yq -r '.serviceName' "$SOURCE_ENV_PARAMS_FILE"
-          )"
-
-          TARGET_ECR_REPOSITORY="$(
-            yq -r '.projectName' "$TARGET_ENV_PARAMS_FILE"
-          )/$(
-            yq -r '.environment' "$TARGET_ENV_PARAMS_FILE"
-          )"/$(
-            yq -r '.serviceName' "$TARGET_ENV_PARAMS_FILE"
-          )"
+          echo "SOURCE_ECR_REPOSITORY=$(yq -r '.projectName' $SOURCE_ENV_PARAMS_FILE)/$(yq -r '.environment' $SOURCE_ENV_PARAMS_FILE)/$(yq -r '.serviceName' $SOURCE_ENV_PARAMS_FILE)"
+          echo "TARGET_ECR_REPOSITORY=$(yq -r '.projectName' $TARGET_ENV_PARAMS_FILE)/$(yq -r '.environment' $TARGET_ENV_PARAMS_FILE)/$(yq -r '.serviceName' $TARGET_ENV_PARAMS_FILE)"
 
           echo "SOURCE_ECR_REPOSITORY: '$SOURCE_ECR_REPOSITORY'"
           echo "TARGET_ECR_REPOSITORY: '$TARGET_ECR_REPOSITORY'"

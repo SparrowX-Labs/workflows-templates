@@ -3,35 +3,29 @@ name: Copy Image
 on:
   workflow_call:
     inputs:
-      image-tag:
-        description: Image tag to promote
-        required: true
+      source-image-tag:
+        description: Source Image Tag To Copy
+        required: false
         type: string
+        default: "dev-deployed"
 
-      image-digest:
-        description: Expected image digest
-        required: true
+      target-image-tag:
+        description: Target Image Tag After Copied
+        required: false
         type: string
+        default: "prod-candidate"
 
       source-env-params-file:
-        description: ECS parameters file for the source environment
+        description: Path to Helm Values file for the source environment
         required: true
         type: string
 
       target-env-params-file:
-        description: ECS parameters file for the target environment
+        description: Path to Helm Values file for the target environment
         required: true
         type: string
-    # Outputs refer to image values in the Prod ECR repo after copying
-    # Image tag is the same, it's added to the outputs to be used by consecutive jobs
-    outputs:
-      image-tag:
-        description: Image tag
-        value: ${{ jobs.copy-image.outputs.image-tag }}
-      image-uri:
-        description: Full immutable image URI
-        value: ${{ jobs.copy-image.outputs.image-uri }}
 
+    
 permissions:
   contents: read
   id-token: write
@@ -40,18 +34,13 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   SOURCE_ENV_PARAMS_FILE: ${{ inputs.source-env-params-file }}
   TARGET_ENV_PARAMS_FILE: ${{ inputs.target-env-params-file }}
-  IMAGE_TAG: ${{ inputs.image-tag }}
-  IMAGE_DIGEST: ${{ inputs.image-digest }}
+  SOURCE_IMAGE_TAG: ${{ inputs.source-image-tag }}
+  TARGET_IMAGE_TAG: ${{ inputs.target-image-tag }}
 
 jobs:
   copy-image:
     name: Copy Image to Target ECR
     runs-on: ubuntu-latest
-
-    
-    outputs:
-      image-tag: ${{ steps.publish-output.outputs.image-tag }}
-      image-uri: ${{ steps.publish-output.outputs.image-uri }}
 
     steps:
 
@@ -64,15 +53,19 @@ jobs:
       - name: Load ECR repositories
         run: |
           SOURCE_ECR_REPOSITORY="$(
-            yq -r '.image.nameSpace' "$SOURCE_ENV_PARAMS_FILE"
+            yq -r '.projectName' "$SOURCE_ENV_PARAMS_FILE"
           )/$(
-            yq -r '.image.repository' "$SOURCE_ENV_PARAMS_FILE"
+            yq -r '.environment' "$SOURCE_ENV_PARAMS_FILE"
+          )"/$(
+            yq -r '.serviceName' "$SOURCE_ENV_PARAMS_FILE"
           )"
 
           TARGET_ECR_REPOSITORY="$(
-            yq -r '.image.nameSpace' "$TARGET_ENV_PARAMS_FILE"
+            yq -r '.projectName' "$TARGET_ENV_PARAMS_FILE"
           )/$(
-            yq -r '.image.repository' "$TARGET_ENV_PARAMS_FILE"
+            yq -r '.environment' "$TARGET_ENV_PARAMS_FILE"
+          )"/$(
+            yq -r '.serviceName' "$TARGET_ENV_PARAMS_FILE"
           )"
 
           if [ -z "$SOURCE_ECR_REPOSITORY" ] || [ "$SOURCE_ECR_REPOSITORY" = "null/null" ]; then
@@ -87,11 +80,6 @@ jobs:
 
           echo "SOURCE_ECR_REPOSITORY=$SOURCE_ECR_REPOSITORY" >> "$GITHUB_ENV"
           echo "TARGET_ECR_REPOSITORY=$TARGET_ECR_REPOSITORY" >> "$GITHUB_ENV"
-
-          echo "Source repository: $SOURCE_ECR_REPOSITORY"
-          echo "Target repository: $TARGET_ECR_REPOSITORY"
-          echo "Image tag: $IMAGE_TAG"
-          echo "Expected digest: $IMAGE_DIGEST"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -143,40 +131,45 @@ jobs:
               --password-stdin \
               "$ECR_REGISTRY"
 
-      - name: Check whether image exists in ECR
-        id: image
+      - name: Resolve Source Image Tag
         run: |
-          set +e
-          describe_output=$(aws ecr describe-images \
-            --repository-name "$TARGET_ECR_REPOSITORY" \
-            --image-ids "imageTag=$IMAGE_TAG" \
-            --region "$AWS_REGION" 2>&1)
-          describe_status=$?
-          set -e
+          IMAGE_DETAILS=$(aws ecr describe-images \
+            --repository-name "$SOURCE_ECR_REPOSITORY" \
+            --image-ids "imageTag=$SOURCE_IMAGE_TAG" \
+            --region "$AWS_REGION" \
+            --query "imageDetails[0].[imageDigest, imageTags[?@!='$SOURCE_IMAGE_TAG'] | [0]]" \
+            --output text)
 
-          if [ "$describe_status" -eq 0 ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image already exists."
-          elif grep -q "ImageNotFoundException" <<< "$describe_output"; then
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Image does not exist; it will be copied."
-          else
-            echo "$describe_output"
-            exit "$describe_status"
+          SOURCE_IMAGE_DIGEST=$(awk '{print $1}' <<< "$IMAGE_DETAILS")
+          GIT_SHA_IMAGE_TAG=$(awk '{print $2}' <<< "$IMAGE_DETAILS")
+
+          if [[ -z "$SOURCE_IMAGE_DIGEST" || "$SOURCE_IMAGE_DIGEST" == "None" ]]; then
+            echo "::error::Could not resolve source image tag: $SOURCE_IMAGE_TAG"
+            exit 1
           fi
 
+          if [[ -z "$GIT_SHA_IMAGE_TAG" || "$GIT_SHA_IMAGE_TAG" == "None" ]]; then
+            echo "::error::No Git SHA tag found for source image digest $SOURCE_IMAGE_DIGEST"
+            exit 1
+          fi
+
+          echo "SOURCE_IMAGE_DIGEST=$SOURCE_IMAGE_DIGEST" >> "$GITHUB_ENV"
+          echo "GIT_SHA_IMAGE_TAG=$GIT_SHA_IMAGE_TAG" >> "$GITHUB_ENV"
+
+          echo "Source image digest: $SOURCE_IMAGE_DIGEST"
+          echo "Original Git SHA tag: $GIT_SHA_IMAGE_TAG"
+
+      # Copy Image with origin git-sha-image-tag       
       - name: Copy image to target ECR
-        id: copy
-        if: steps.image.outputs.exists != 'true'
         run: |
           ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-          SOURCE_IMAGE="docker://$ECR_REGISTRY/$SOURCE_ECR_REPOSITORY@$IMAGE_DIGEST"
-          TARGET_IMAGE="docker://$ECR_REGISTRY/$TARGET_ECR_REPOSITORY:$IMAGE_TAG"
+          SOURCE_IMAGE="docker://$ECR_REGISTRY/$SOURCE_ECR_REPOSITORY@$SOURCE_IMAGE_DIGEST"
+          TARGET_IMAGE="docker://$ECR_REGISTRY/$TARGET_ECR_REPOSITORY:$GIT_SHA_IMAGE_TAG"
 
           echo "Copying image..."
-          echo "Source: $SOURCE_ECR_REPOSITORY@$IMAGE_DIGEST"
-          echo "Target: $TARGET_ECR_REPOSITORY:$IMAGE_TAG"
+          echo "Source: $SOURCE_ECR_REPOSITORY@$SOURCE_IMAGE_DIGEST"
+          echo "Target: $TARGET_ECR_REPOSITORY:$GIT_SHA_IMAGE_TAG"
 
           skopeo copy \
             --all \
@@ -185,35 +178,93 @@ jobs:
 
           echo "Image copied successfully."
 
-          TARGET_IMAGE_URI="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$IMAGE_DIGEST"
-          echo "image-tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-          echo "target-image-uri=$TARGET_IMAGE_URI" >> "$GITHUB_OUTPUT"
-
-      - name: Check target image signature
-        id: signature
+      # Cleanu-up target-image-tag that's already in use, to assign it to a new image
+      - name: Cleanup previous target image tag
         run: |
-          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          set +e
+          describe_output=$(aws ecr describe-images \
+            --repository-name "$TARGET_ECR_REPOSITORY" \
+            --image-ids "imageTag=$TARGET_IMAGE_TAG" \
+            --region "$AWS_REGION" 2>&1)
+          describe_status=$?
+          set -e
+
+          if [ "$describe_status" -eq 0 ]; then
+            echo "Image tag exists. Deleting it..."
+
+            aws ecr batch-delete-image \
+              --repository-name "$TARGET_ECR_REPOSITORY" \
+              --image-ids "imageTag=$TARGET_IMAGE_TAG" \
+              --region "$AWS_REGION"
+
+            echo "Target Image tag cleaned successfully."
+          elif grep -q "ImageNotFoundException" <<< "$describe_output"; then
+            echo "Image tag does not exist; proceeding..."
+          else
+            echo "$describe_output"
+            exit "$describe_status"
+          fi
+
+      # Attach target-image-tag to the copied image
+      - name: Add target image tag to target image
+        run: |
+          IMAGE_MANIFEST=$(aws ecr batch-get-image \
+            --repository-name "$TARGET_ECR_REPOSITORY" \
+            --image-ids "imageTag=$GIT_SHA_IMAGE_TAG" \
+            --region "$AWS_REGION" \
+            --query 'images[0].imageManifest' \
+            --output text)
+
+          IMAGE_MANIFEST_MEDIA_TYPE=$(aws ecr batch-get-image \
+            --repository-name "$TARGET_ECR_REPOSITORY" \
+            --image-ids "imageTag=$GIT_SHA_IMAGE_TAG" \
+            --region "$AWS_REGION" \
+            --query 'images[0].imageManifestMediaType' \
+            --output text)
+
+          aws ecr put-image \
+            --repository-name "$TARGET_ECR_REPOSITORY" \
+            --image-tag "$TARGET_IMAGE_TAG" \
+            --image-manifest "$IMAGE_MANIFEST" \
+            --image-manifest-media-type "$IMAGE_MANIFEST_MEDIA_TYPE" \
+            --region "$AWS_REGION"
+
+          echo "Added target image tag to copied image."
+
+      - name: Verify copied image
+        run: |
+          echo "Verifying copied image in target ECR..."
 
           TARGET_DIGEST="$(aws ecr describe-images \
             --repository-name "$TARGET_ECR_REPOSITORY" \
-            --image-ids "imageTag=$IMAGE_TAG" \
+            --image-ids "imageTag=$TARGET_IMAGE_TAG" \
             --region "$AWS_REGION" \
             --query 'imageDetails[0].imageDigest' \
             --output text)"
 
           if [ -z "$TARGET_DIGEST" ] || [ "$TARGET_DIGEST" = "None" ]; then
-            echo "Target image tag '$IMAGE_TAG' was not found after image copy."
+            echo "Target image tag '$TARGET_IMAGE_TAG' was not found after image copy."
             exit 1
           fi
 
-          if [ "$TARGET_DIGEST" != "$IMAGE_DIGEST" ]; then
+          if [ "$TARGET_DIGEST" != "$SOURCE_IMAGE_DIGEST" ]; then
             echo "Target image digest does not match the expected source digest."
-            echo "Expected: $IMAGE_DIGEST"
+            echo "Expected: $SOURCE_IMAGE_DIGEST"
             echo "Target:   $TARGET_DIGEST"
             exit 1
           fi
 
+          echo "TARGET_DIGEST=$TARGET_DIGEST" >> "$GITHUB_ENV"
+
+          echo "Image copied successfully."
+
+      - name: Copy image signature
+        run: |
+          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          SOURCE_IMAGE="$ECR_REGISTRY/$SOURCE_ECR_REPOSITORY@$SOURCE_IMAGE_DIGEST"
           TARGET_IMAGE="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$TARGET_DIGEST"
+
           echo "Inspecting signature referrers for: $TARGET_IMAGE"
 
           DISCOVER_OUTPUT="$(oras discover \
@@ -227,62 +278,23 @@ jobs:
             echo "Cosign signature already exists; skipping signature copy."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Cosign signature is missing; it will be copied."
+            echo "Cosign signature doesn't exist in target repo; it will be copied."
+
+            echo "Copying Cosign signature..."
+            echo "Source: $SOURCE_IMAGE"
+            echo "Target: $TARGET_IMAGE"
+
+            oras discover "$SOURCE_IMAGE"
+
+            # Copy the Cosign signature/referrers from source to target.
+            oras cp \
+              "$SOURCE_IMAGE" \
+              "$TARGET_IMAGE" \
+              --recursive
+
+            echo "Cosign signature copied successfully."
           fi
-
-      - name: Copy image signature
-        if: steps.signature.outputs.exists != 'true'
-        run: |
-          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-          SOURCE_IMAGE="$ECR_REGISTRY/$SOURCE_ECR_REPOSITORY@$IMAGE_DIGEST"
-          TARGET_IMAGE="$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$IMAGE_DIGEST"
-
-          echo "Copying Cosign signature..."
-          echo "Source: $SOURCE_IMAGE"
-          echo "Target: $TARGET_IMAGE"
-
-          oras discover "$SOURCE_IMAGE"
-
-          # Copy the Cosign signature/referrers from source to target.
-          oras cp \
-            "$SOURCE_IMAGE" \
-            "$TARGET_IMAGE" \
-            --recursive
-
-          echo "Cosign signature copied successfully."
           
-      - name: Verify promoted image
-        id: verify
-        run: |
-          echo "Verifying image in target ECR..."
-
-          TARGET_IMAGE_DIGEST="$(
-            aws ecr describe-images \
-              --repository-name "$TARGET_ECR_REPOSITORY" \
-              --image-ids imageTag="$IMAGE_TAG" \
-              --region "$AWS_REGION" \
-              --query 'imageDetails[0].imageDigest' \
-              --output text
-          )"
-
-          echo "Expected digest: $IMAGE_DIGEST"
-          echo "Target digest:   $TARGET_IMAGE_DIGEST"
-
-          if [ "$TARGET_IMAGE_DIGEST" != "$IMAGE_DIGEST" ]; then
-            echo "ERROR: Target image digest does not match source image digest."
-            exit 1
-          fi
-
-          echo "Image promotion verified successfully."
-
-      - name: Publish copied image outputs
-        id: publish-output
-        run: |
-          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          echo "image-tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-          echo "image-uri=$ECR_REGISTRY/$TARGET_ECR_REPOSITORY@$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
-
       - name: Add promotion summary
         if: always()
         run: |
@@ -293,8 +305,7 @@ jobs:
             echo "|---|---|"
             echo "| Source repository | \`$SOURCE_ECR_REPOSITORY\` |"
             echo "| Target repository | \`$TARGET_ECR_REPOSITORY\` |"
-            echo "| Image tag | \`$IMAGE_TAG\` |"
-            echo "| Image digest | \`$IMAGE_DIGEST\` |"
-            echo "| Image existed before copy | \`$IMAGE_EXISTS\` |"
+            echo "| Image tag | \`$SOURCE_IMAGE_TAG\` |"
+            echo "| Image digest | \`$TARGET_DIGEST\` |"
             echo "| Result | \`${{ job.status }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
